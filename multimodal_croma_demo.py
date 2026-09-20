@@ -7,6 +7,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import shutil
+import time
 
 import torch
 from torch import nn
@@ -98,6 +99,7 @@ def run_training(config, raw_contacts, output_dir: Path):
     训练,过站时上传匹配特征供地面端融合训练;每攒满 aggregation_k 次贡献
     做一次全局聚合。结束后评估、写日志并保存 checkpoint。
     """
+    run_started_at = time.perf_counter()
     training, model_config = config["segmentation_training"], config["croma"]
     torch.manual_seed(training["seed"])
     torch.set_num_threads(1)
@@ -170,6 +172,8 @@ def run_training(config, raw_contacts, output_dir: Path):
         status, reason = "completed", ""
         losses = {"segmentation": [], "radar_distillation": [], "optical_distillation": []}
         aggregation_members, aggregation_performed = "", False
+        test_accuracy, test_miou = "", ""
+        server_mean_loss = ""
         # 4) 三种跳过情形:无匹配特征 / 地面站忙到窗口断开 / 事务放不进窗口
         if not matched_ids:
             status, reason = "skipped", "no_matched_multimodal_features"
@@ -181,6 +185,10 @@ def run_training(config, raw_contacts, output_dir: Path):
             # 5) 地面端:跨模态编码器 + 地面头在匹配特征上做监督训练
             losses = train_server_on_matched_features(pair, matched_ids, cross_encoder, ground_head, radar_projection, optical_projection, attention_bias, server_optimizer, criterion, image_size, device)
             server_updates += len(losses["segmentation"])
+            server_mean_loss = (
+                sum(losses["segmentation"]) / len(losses["segmentation"])
+                if losses["segmentation"] else ""
+            )
             global_states["radar_projection"] = clone_state(radar_projection)
             global_states["optical_projection"] = clone_state(optical_projection)
             # 该对上传的四份状态(雷达/光学编码器 + 辅助头)作为一次待聚合贡献
@@ -198,6 +206,24 @@ def run_training(config, raw_contacts, output_dir: Path):
                 }
                 global_version, aggregation_performed = global_version + 1, True
                 aggregation_log.append({"global_version": global_version, "finish_utc": utc_at(epoch, finish_s), "plane_pairs": aggregation_members, "pair_count": aggregation_k, "weight_per_pair": round(1.0 / aggregation_k, 8)})
+                # Evaluate the newly aggregated global model once per aggregation.
+                test_accuracy, test_miou, _ = evaluate_global(
+                    test_data, radar_worker, optical_worker, cross_encoder,
+                    ground_head, attention_bias, global_states, config, device,
+                )
+                elapsed_s = time.perf_counter() - run_started_at
+                server_loss_text = (
+                    f"{server_mean_loss:.8f}"
+                    if server_mean_loss != "" else "n/a"
+                )
+                print(
+                    "[aggregation] "
+                    f"wall_time={datetime.now().astimezone().isoformat(timespec='seconds')} "
+                    f"elapsed_s={elapsed_s:.3f} "
+                    f"server_mean_loss={server_loss_text} "
+                    f"test_accuracy={test_accuracy:.8f} test_miou={test_miou:.8f}",
+                    flush=True,
+                )
                 pending.clear()
             # 7) 该对重置到最新全局模型,并清空特征缓冲(避免上传陈旧特征)
             reset_pair_from_global(pair, global_states, global_version)
@@ -215,9 +241,10 @@ def run_training(config, raw_contacts, output_dir: Path):
             "status": status, "reason": reason, "matched_batches": len(matched_ids),
             "radar_upload_bytes": estimate["radar_upload_bytes"], "optical_upload_bytes": estimate["optical_upload_bytes"],
             "server_updates": len(losses["segmentation"]),
-            "server_mean_loss": round(sum(losses["segmentation"]) / len(losses["segmentation"]), 8) if losses["segmentation"] else "",
+            "server_mean_loss": round(server_mean_loss, 8) if server_mean_loss != "" else "",
             "radar_distillation_mean_loss": round(sum(losses["radar_distillation"]) / len(losses["radar_distillation"]), 8) if losses["radar_distillation"] else "",
             "optical_distillation_mean_loss": round(sum(losses["optical_distillation"]) / len(losses["optical_distillation"]), 8) if losses["optical_distillation"] else "",
+            "test_accuracy": test_accuracy, "test_miou": test_miou,
             "aggregation_performed": int(aggregation_performed), "aggregation_members": aggregation_members,
             "global_version": global_version, "modeled_transaction_s": round(estimate["duration_s"], 8),
         })
@@ -254,7 +281,8 @@ def run_training(config, raw_contacts, output_dir: Path):
         "skipped_pair_contacts": len(contact_log) - successful, "aggregations": len(aggregation_log),
         "aggregation_k": aggregation_k, "aggregation": "uniform arithmetic mean per modality",
         "projection_distillation": "projR/projO MSE to detached cross_encoder features",
-        "pixel_accuracy": pixel_accuracy, "mean_iou": mean_iou, "confusion_matrix": confusion,
+        "pixel_accuracy": pixel_accuracy, "mean_iou": mean_iou, 
+        # "confusion_matrix": confusion,
         "last_ground_transaction_utc": utc_at(epoch, ground_available_s),
         "pending_matched_batches": {pair_id: len(pair.matched_batch_ids()) for pair_id, pair in pairs.items() if pair.matched_batch_ids()},
     }
