@@ -40,13 +40,13 @@
   },
   "croma": {
     "profile": "tiny_demo",
-    "patch_size": 8,
+    "patch_size": 1,
     "encoder_dim": 192,
     "encoder_layers": 6,
     "attention_heads": 4,
     "decoder_dim": 64,
     "decoder_layers": 1,
-    "num_patches": 16,
+    "num_patches": 8,
     "pretrained_checkpoint": null
   },
   "segmentation_training": {
