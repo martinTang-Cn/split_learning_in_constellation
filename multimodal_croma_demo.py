@@ -212,14 +212,15 @@ def run_training(config, raw_contacts, output_dir: Path):
                     ground_head, attention_bias, global_states, config, device,
                 )
                 elapsed_s = time.perf_counter() - run_started_at
+                runtime_text = f"[{int(elapsed_s // 60):02d}:{int(elapsed_s % 60):02d}]"
                 server_loss_text = (
                     f"{server_mean_loss:.8f}"
                     if server_mean_loss != "" else "n/a"
                 )
                 print(
                     "[aggregation] "
-                    f"wall_time={datetime.now().astimezone().isoformat(timespec='seconds')} "
-                    f"elapsed_s={elapsed_s:.3f} "
+                    f"window_end_utc={contact['end_utc']} "
+                    f"runtime={runtime_text} "
                     f"server_mean_loss={server_loss_text} "
                     f"test_accuracy={test_accuracy:.8f} test_miou={test_miou:.8f}",
                     flush=True,
