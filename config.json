@@ -57,7 +57,7 @@
     "encoder_learning_rate": 0.0001,
     "auxiliary_learning_rate": 0.0001,
     "server_learning_rate": 0.0001,
-    "freeze_projection_during_disconnection": true,
+    "freeze_projection_during_disconnection": false,
     "local_steps_per_disconnection": 30,
     "recent_smashed_batches": 5,
     "aggregation_k": 1,
