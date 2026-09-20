@@ -46,7 +46,7 @@
     "attention_heads": 4,
     "decoder_dim": 64,
     "decoder_layers": 1,
-    "num_patches": 8,
+    "num_patches": 64,
     "pretrained_checkpoint": null
   },
   "segmentation_training": {
