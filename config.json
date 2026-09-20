@@ -1,7 +1,7 @@
 {
   "simulation": {
     "epoch_utc": "2026-09-14T00:00:00Z",
-    "duration_hours": 24,
+    "duration_hours": 90,
     "orbit_sample_step_s": 30,
     "contact_detection_step_s": 5
   },
@@ -57,7 +57,7 @@
     "encoder_learning_rate": 0.0001,
     "auxiliary_learning_rate": 0.0001,
     "server_learning_rate": 0.0001,
-    "freeze_projection_during_disconnection": false,
+    "freeze_projection_during_disconnection": true,
     "local_steps_per_disconnection": 30,
     "recent_smashed_batches": 5,
     "aggregation_k": 1,
