@@ -52,7 +52,7 @@ class CROMA(nn.Module):
                        patch_size=self.patch_size,
                        )
         self.cross_encoder = BaseTransformerCrossAttn(dim=self.encoder_dim,
-                                                      layers=self.encoder_layers/2,
+                                                      layers=self.encoder_layers,
                                                       attention_heads=self.attention_heads,
                                                       )
         self.GAP_FFN_radar = nn.Sequential(
