@@ -28,8 +28,8 @@
     "safety_margin_s": 1.0
   },
   "dataset": {
-    "name": "whu_opt_sar",
-    "root_dir": null,
+    "name": "houston",
+    "root_dir": "~/data/Houston2013",
     "train_ratio": 0.8,
     "stride_ratio": 0.9,
     "stride": null,
