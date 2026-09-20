@@ -1,0 +1,70 @@
+{
+  "simulation": {
+    "epoch_utc": "2026-09-14T00:00:00Z",
+    "duration_hours": 24,
+    "orbit_sample_step_s": 30,
+    "contact_detection_step_s": 5
+  },
+  "constellation": {
+    "walker_type": "delta",
+    "total_satellites": 8,
+    "planes": 4,
+    "phasing_factor": 1,
+    "altitude_km": 550.0,
+    "inclination_deg": 53.0
+  },
+  "ground_station": {
+    "name": "Beijing",
+    "latitude_deg": 39.9042,
+    "longitude_deg": 116.4074,
+    "altitude_m": 50.0,
+    "minimum_elevation_deg": 10.0,
+    "simultaneous_links": 1
+  },
+  "link": {
+    "uplink_mbps": 100.0,
+    "downlink_mbps": 12.0,
+    "protocol_overhead_bytes": 512,
+    "safety_margin_s": 1.0
+  },
+  "dataset": {
+    "name": "whu_opt_sar",
+    "root_dir": null,
+    "train_ratio": 0.8,
+    "stride_ratio": 0.9,
+    "stride": null,
+    "drop_empty": true,
+    "normalize": true,
+    "norm_type": "standard",
+    "num_ratio": 1.0
+  },
+  "croma": {
+    "profile": "tiny_demo",
+    "patch_size": 8,
+    "encoder_dim": 192,
+    "encoder_layers": 6,
+    "attention_heads": 4,
+    "decoder_dim": 64,
+    "decoder_layers": 1,
+    "num_patches": 16,
+    "pretrained_checkpoint": null
+  },
+  "segmentation_training": {
+    "seed": 42,
+    "device": "cuda",
+    "batch_size": 16,
+    "epochs": 50,
+    "encoder_learning_rate": 0.0001,
+    "auxiliary_learning_rate": 0.0001,
+    "server_learning_rate": 0.0001,
+    "freeze_projection_during_disconnection": true,
+    "local_steps_per_disconnection": 4,
+    "recent_smashed_batches": 5,
+    "aggregation_k": 1,
+    "radar_local_compute_s": 0.5,
+    "optical_local_compute_s": 0.5,
+    "server_compute_s_per_batch": 0.2,
+    "aggregation_compute_s": 0.05,
+    "paired_uplink_mode": "parallel_full_rate"
+  }
+}
