@@ -53,7 +53,7 @@
     "seed": 42,
     "device": "cuda",
     "batch_size": 16,
-    "epochs": 50,
+    "epochs": 300,
     "encoder_learning_rate": 0.0001,
     "auxiliary_learning_rate": 0.0001,
     "server_learning_rate": 0.0001,
