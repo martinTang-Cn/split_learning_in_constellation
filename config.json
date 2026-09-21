@@ -60,7 +60,7 @@
     "freeze_projection_during_disconnection": false,
     "local_steps_per_disconnection": 20,
     "recent_smashed_batches": 20,
-    "aggregation_k": 1,
+    "aggregation_k": 4,
     "radar_local_compute_s": 0.5,
     "optical_local_compute_s": 0.5,
     "server_compute_s_per_batch": 0.2,
