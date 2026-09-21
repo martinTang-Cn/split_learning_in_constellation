@@ -130,10 +130,11 @@ def run_training(config, raw_contacts, output_dir: Path):
     optical_projection = FeatureProjection(model_config["encoder_dim"]).to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=dataset_bundle.metadata.ignore_index)
     # 地面端训练 cross encoder、地面头和两个特征投影层；投影层随后下发给对应卫星。
-    server_optimizer = torch.optim.SGD(
+    server_optimizer = torch.optim.AdamW(
         list(cross_encoder.parameters()) + list(ground_head.parameters())
         + list(radar_projection.parameters()) + list(optical_projection.parameters()),
         lr=training["server_learning_rate"],
+        weight_decay=float(training.get("weight_decay", 0.01)),
     )
     # 全局模型状态(FedAvg 聚合对象):各卫星对由它初始化,聚合后重置回它
     global_states = {

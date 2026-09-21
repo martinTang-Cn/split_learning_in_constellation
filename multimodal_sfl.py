@@ -121,8 +121,9 @@ def train_pair_offline(
     if not freeze_projection:
         radar_parameters.insert(1, {"params": radar_projection.parameters(), "lr": training["auxiliary_learning_rate"]})
         optical_parameters.insert(1, {"params": optical_projection.parameters(), "lr": training["auxiliary_learning_rate"]})
-    radar_optimizer = torch.optim.SGD(radar_parameters)
-    optical_optimizer = torch.optim.SGD(optical_parameters)
+    weight_decay = float(training.get("weight_decay", 0.01))
+    radar_optimizer = torch.optim.AdamW(radar_parameters, weight_decay=weight_decay)
+    optical_optimizer = torch.optim.AdamW(optical_parameters, weight_decay=weight_decay)
     step_s = max(float(training["radar_local_compute_s"]), float(training["optical_local_compute_s"]))
     buffer_limit = int(training["recent_smashed_batches"])
     image_size = int(config["croma"]["patch_size"]) * math.isqrt(int(config["croma"]["num_patches"]))
