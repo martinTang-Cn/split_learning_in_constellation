@@ -43,8 +43,8 @@
     "patch_size": 1,
     "encoder_dim": 192,
     "encoder_layers": 6,
-    "attention_heads": 4,
-    "decoder_dim": 64,
+    "attention_heads": 16,
+    "decoder_dim": 512,
     "decoder_layers": 1,
     "num_patches": 64,
     "pretrained_checkpoint": null
