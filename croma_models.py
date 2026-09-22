@@ -78,6 +78,57 @@ def load_checkpoint_if_configured(croma: CROMA, config, project_dir: Path) -> st
     )
 
 
+def pretrained_encoder_schedule(config) -> dict[str, int | bool]:
+    """Return the staged fine-tuning policy for satellite encoders."""
+    checkpoint_configured = bool(config["croma"].get("pretrained_checkpoint"))
+    training = config["segmentation_training"]
+    return {
+        "enabled": checkpoint_configured,
+        "warmup_aggregations": max(
+            0, int(training.get("pretrained_encoder_warmup_aggregations", 5))
+        ),
+        "trainable_blocks": max(
+            0, int(training.get("pretrained_encoder_trainable_blocks", 1))
+        ),
+    }
+
+
+def configure_satellite_encoder_trainability(
+    radar_encoder: nn.Module,
+    optical_encoder: nn.Module,
+    config,
+    global_version: int,
+) -> str:
+    """Apply the checkpoint-aware freeze/unfreeze stage.
+
+    With a checkpoint, the warmup stage freezes all satellite encoder
+    parameters. Afterwards only the final Transformer blocks are unfrozen;
+    the input projection and earlier blocks remain frozen for the full run.
+    Without a checkpoint, the original fully trainable behavior is retained.
+    """
+    schedule = pretrained_encoder_schedule(config)
+    if not schedule["enabled"]:
+        radar_encoder.requires_grad_(True)
+        optical_encoder.requires_grad_(True)
+        return "full_train"
+
+    warmup_aggregations = int(schedule["warmup_aggregations"])
+    trainable_blocks = int(schedule["trainable_blocks"])
+    if global_version < warmup_aggregations or trainable_blocks == 0:
+        radar_encoder.requires_grad_(False)
+        optical_encoder.requires_grad_(False)
+        return "pretrained_frozen"
+
+    for encoder in (radar_encoder, optical_encoder):
+        encoder.requires_grad_(False)
+        layers = getattr(getattr(encoder, "transformer", None), "layers", None)
+        if layers is None:
+            raise AttributeError("CROMA ViT encoder does not expose transformer.layers")
+        for block in layers[-trainable_blocks:]:
+            block.requires_grad_(True)
+    return f"pretrained_last_{trainable_blocks}_blocks"
+
+
 def build_croma_components(config, device, project_dir: Path):
     model_config = config["croma"]
     dataset_metadata = config["dataset_metadata"]

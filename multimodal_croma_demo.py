@@ -12,7 +12,13 @@ import time
 import torch
 from torch import nn
 
-from croma_models import FeatureProjection, PatchSegmentationHead, build_croma_components
+from croma_models import (
+    FeatureProjection,
+    PatchSegmentationHead,
+    build_croma_components,
+    configure_satellite_encoder_trainability,
+    pretrained_encoder_schedule,
+)
 from multimodal_data import (
     PairedBatchSequence,
     build_dataset_bundle,
@@ -146,6 +152,18 @@ def run_training(config, raw_contacts, output_dir: Path):
     # 每个轨道面构建一个卫星对:本地状态副本 + 确定性批次流
     pairs = make_plane_pairs(pair_contacts, global_states, config, dataset_bundle)
     test_data = dataset_bundle.validation
+    encoder_schedule = pretrained_encoder_schedule(config)
+    encoder_stage = configure_satellite_encoder_trainability(
+        radar_worker, optical_worker, config, global_version=0
+    )
+    if encoder_schedule["enabled"]:
+        print(
+            "[pretrained-encoder] "
+            f"stage={encoder_stage} "
+            f"warmup_aggregations={encoder_schedule['warmup_aggregations']} "
+            f"trainable_blocks={encoder_schedule['trainable_blocks']}",
+            flush=True,
+        )
     # 每攒满 k 个卫星对的贡献做一次全局聚合
     aggregation_k = int(training["aggregation_k"])
     if not 1 <= aggregation_k <= len(pairs):
@@ -158,6 +176,10 @@ def run_training(config, raw_contacts, output_dir: Path):
     # 离散事件主循环:按时间顺序处理每个配对可见窗口
     for contact in pair_contacts:
         pair: PlanePair = pairs[contact["pair_id"]]
+        # 单卡用共享 worker 模拟多个卫星；每个窗口前应用当前冻结阶段。
+        configure_satellite_encoder_trainability(
+            radar_worker, optical_worker, config, global_version
+        )
         # 1) 窗口开始前:卫星对在不可见时段做星上本地训练,产出带版本号的特征包
         train_pair_offline(pair, contact["start_offset_s"], config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
         # 2) 找到双模态缓冲区中可对齐融合的批次(batch_number 交集)
@@ -206,6 +228,9 @@ def run_training(config, raw_contacts, output_dir: Path):
                     "optical_projection": global_states["optical_projection"],
                 }
                 global_version, aggregation_performed = global_version + 1, True
+                encoder_stage = configure_satellite_encoder_trainability(
+                    radar_worker, optical_worker, config, global_version
+                )
                 aggregation_log.append({"global_version": global_version, "finish_utc": utc_at(epoch, finish_s), "plane_pairs": aggregation_members, "pair_count": aggregation_k, "weight_per_pair": round(1.0 / aggregation_k, 8)})
                 # Evaluate the newly aggregated global model once per aggregation.
                 test_accuracy, test_miou, _ = evaluate_global(
@@ -282,6 +307,12 @@ def run_training(config, raw_contacts, output_dir: Path):
         "server_updates": server_updates, "successful_pair_transactions": successful,
         "skipped_pair_contacts": len(contact_log) - successful, "aggregations": len(aggregation_log),
         "aggregation_k": aggregation_k, "aggregation": "uniform arithmetic mean per modality",
+        "pretrained_encoder_schedule": {
+            "enabled": bool(encoder_schedule["enabled"]),
+            "warmup_aggregations": int(encoder_schedule["warmup_aggregations"]),
+            "trainable_blocks_after_warmup": int(encoder_schedule["trainable_blocks"]),
+            "final_stage": encoder_stage,
+        },
         "projection_distillation": "projR/projO MSE to detached cross_encoder features",
         "pixel_accuracy": pixel_accuracy, "mean_iou": mean_iou, 
         # "confusion_matrix": confusion,

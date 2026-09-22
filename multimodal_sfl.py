@@ -92,6 +92,11 @@ def _prune_buffer(buffer: dict[int, FeaturePacket], limit: int) -> None:
         del buffer[next(iter(buffer))]
 
 
+def _trainable_parameters(module):
+    """Return only parameters enabled by the current freeze schedule."""
+    return [parameter for parameter in module.parameters() if parameter.requires_grad]
+
+
 def train_pair_offline(
     pair: PlanePair, stop_time_s, config, radar_worker, optical_worker, radar_auxiliary,
     optical_auxiliary, radar_projection, optical_projection, attention_bias,
@@ -111,16 +116,16 @@ def train_pair_offline(
     radar_projection.requires_grad_(not freeze_projection)
     optical_projection.requires_grad_(not freeze_projection)
     radar_parameters = [
-        {"params": radar_worker.parameters(), "lr": training["encoder_learning_rate"]},
-        {"params": radar_auxiliary.parameters(), "lr": training["auxiliary_learning_rate"]},
+        {"params": _trainable_parameters(radar_worker), "lr": training["encoder_learning_rate"]},
+        {"params": _trainable_parameters(radar_auxiliary), "lr": training["auxiliary_learning_rate"]},
     ]
     optical_parameters = [
-        {"params": optical_worker.parameters(), "lr": training["encoder_learning_rate"]},
-        {"params": optical_auxiliary.parameters(), "lr": training["auxiliary_learning_rate"]},
+        {"params": _trainable_parameters(optical_worker), "lr": training["encoder_learning_rate"]},
+        {"params": _trainable_parameters(optical_auxiliary), "lr": training["auxiliary_learning_rate"]},
     ]
     if not freeze_projection:
-        radar_parameters.insert(1, {"params": radar_projection.parameters(), "lr": training["auxiliary_learning_rate"]})
-        optical_parameters.insert(1, {"params": optical_projection.parameters(), "lr": training["auxiliary_learning_rate"]})
+        radar_parameters.insert(1, {"params": _trainable_parameters(radar_projection), "lr": training["auxiliary_learning_rate"]})
+        optical_parameters.insert(1, {"params": _trainable_parameters(optical_projection), "lr": training["auxiliary_learning_rate"]})
     weight_decay = float(training.get("weight_decay", 0.01))
     radar_optimizer = torch.optim.AdamW(radar_parameters, weight_decay=weight_decay)
     optical_optimizer = torch.optim.AdamW(optical_parameters, weight_decay=weight_decay)
