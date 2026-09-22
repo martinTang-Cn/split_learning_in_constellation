@@ -47,7 +47,7 @@
     "decoder_dim": 512,
     "decoder_layers": 1,
     "num_patches": 64,
-    "pretrained_checkpoint": null
+    "pretrained_checkpoint": "~/work/CROMA_checkpoint/croma_whu_pretrain_checkpoints/20260517_033658_houston2013_standard/checkpoint_epoch_300.pt"
   },
   "segmentation_training": {
     "seed": 42,
