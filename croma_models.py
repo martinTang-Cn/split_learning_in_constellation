@@ -78,12 +78,16 @@ def load_checkpoint_if_configured(croma: CROMA, config, project_dir: Path) -> st
     )
 
 
-def pretrained_encoder_schedule(config) -> dict[str, int | bool]:
-    """Return the staged fine-tuning policy for satellite encoders."""
-    checkpoint_configured = bool(config["croma"].get("pretrained_checkpoint"))
+def pretrained_encoder_schedule(config) -> dict[str, int | str]:
+    """Return the configured satellite encoder training policy."""
     training = config["segmentation_training"]
+    mode = str(training.get("satellite_encoder_training_mode", "staged")).lower()
+    if mode not in {"frozen", "staged", "full"}:
+        raise ValueError(
+            "satellite_encoder_training_mode must be one of: frozen, staged, full"
+        )
     return {
-        "enabled": checkpoint_configured,
+        "mode": mode,
         "warmup_aggregations": max(
             0, int(training.get("pretrained_encoder_warmup_aggregations", 5))
         ),
@@ -99,18 +103,18 @@ def configure_satellite_encoder_trainability(
     config,
     global_version: int,
 ) -> str:
-    """Apply the checkpoint-aware freeze/unfreeze stage.
-
-    With a checkpoint, the warmup stage freezes all satellite encoder
-    parameters. Afterwards only the final Transformer blocks are unfrozen;
-    the input projection and earlier blocks remain frozen for the full run.
-    Without a checkpoint, the original fully trainable behavior is retained.
-    """
+    """Apply the configured satellite encoder freeze/unfreeze policy."""
     schedule = pretrained_encoder_schedule(config)
-    if not schedule["enabled"]:
+    mode = str(schedule["mode"])
+    if mode == "full":
         radar_encoder.requires_grad_(True)
         optical_encoder.requires_grad_(True)
         return "full_train"
+
+    if mode == "frozen":
+        radar_encoder.requires_grad_(False)
+        optical_encoder.requires_grad_(False)
+        return "frozen"
 
     warmup_aggregations = int(schedule["warmup_aggregations"])
     trainable_blocks = int(schedule["trainable_blocks"])

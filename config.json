@@ -57,6 +57,7 @@
     "encoder_learning_rate": 0.0001,
     "auxiliary_learning_rate": 0.0001,
     "server_learning_rate": 0.0001,
+    "satellite_encoder_training_mode": "frozen",
     "pretrained_encoder_warmup_aggregations": 5,
     "pretrained_encoder_trainable_blocks": 1,
     "freeze_projection_during_disconnection": true,

@@ -133,6 +133,14 @@ GPU. Checkpoint weights must match the configured image size and modality
 channel counts; no spectral-band projection or channel truncation is applied.
 The dataset adapters validate these settings before model construction.
 
+Satellite encoder training is controlled by
+`segmentation_training.satellite_encoder_training_mode`:
+`frozen` keeps both satellite encoders frozen for the whole run, `staged`
+freezes them for `pretrained_encoder_warmup_aggregations` aggregations and
+then unfreezes only the last `pretrained_encoder_trainable_blocks` Transformer
+blocks, and `full` trains all satellite encoder parameters throughout. The
+default is `staged`.
+
 ## Run
 
 ```powershell

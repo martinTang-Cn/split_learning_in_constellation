@@ -156,9 +156,10 @@ def run_training(config, raw_contacts, output_dir: Path):
     encoder_stage = configure_satellite_encoder_trainability(
         radar_worker, optical_worker, config, global_version=0
     )
-    if encoder_schedule["enabled"]:
+    if encoder_schedule["mode"] != "full":
         print(
             "[pretrained-encoder] "
+            f"mode={encoder_schedule['mode']} "
             f"stage={encoder_stage} "
             f"warmup_aggregations={encoder_schedule['warmup_aggregations']} "
             f"trainable_blocks={encoder_schedule['trainable_blocks']}",
@@ -308,7 +309,7 @@ def run_training(config, raw_contacts, output_dir: Path):
         "skipped_pair_contacts": len(contact_log) - successful, "aggregations": len(aggregation_log),
         "aggregation_k": aggregation_k, "aggregation": "uniform arithmetic mean per modality",
         "pretrained_encoder_schedule": {
-            "enabled": bool(encoder_schedule["enabled"]),
+            "mode": str(encoder_schedule["mode"]),
             "warmup_aggregations": int(encoder_schedule["warmup_aggregations"]),
             "trainable_blocks_after_warmup": int(encoder_schedule["trainable_blocks"]),
             "final_stage": encoder_stage,
