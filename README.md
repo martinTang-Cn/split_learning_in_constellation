@@ -149,6 +149,32 @@ python -m pip install -r requirements.txt
 python run_demo.py
 ```
 
+To run the standard split-learning baseline with the same orbit contacts and
+dataset configuration, use:
+
+```powershell
+python standard_split_learning_demo.py
+```
+
+The baseline reads `croma.pretrained_checkpoint` and supports CROMA
+pretraining checkpoints saved with `model_state_dict`. A checkpoint can also
+be supplied for one run without editing the config:
+
+```powershell
+python standard_split_learning_demo.py --pretrained-checkpoint "D:\path\to\checkpoint.pt"
+```
+
+The checkpoint must match the configured `patch_size`, `num_patches`,
+`encoder_dim`, and radar/optical channel counts. The segmentation head is
+initialized by the downstream experiment because it is not part of CROMA
+pretraining.
+
+This baseline performs no training while a satellite pair is disconnected.
+At each paired contact it trains the two satellite encoders for
+`segmentation_training.recent_smashed_batches` batches, while the ground
+station trains the shared cross encoder and segmentation head. Its timestamped
+results are written under `../standard_split_learning_demo/`.
+
 `device=auto` selects `cuda:0` when CUDA PyTorch is available and otherwise
 uses CPU.
 

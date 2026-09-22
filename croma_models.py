@@ -68,10 +68,35 @@ def load_checkpoint_if_configured(croma: CROMA, config, project_dir: Path) -> st
     checkpoint_path = Path(checkpoint_value)
     if not checkpoint_path.is_absolute():
         checkpoint_path = project_dir / checkpoint_path
-    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    state = payload.get("model", payload.get("state_dict", payload))
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            "Configured pretrained checkpoint does not exist: "
+            f"{checkpoint_path.resolve()}"
+        )
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Pretrained checkpoint must contain a state dictionary: {checkpoint_path}"
+        )
+    # CROMA pretraining saves model weights under model_state_dict.  Also keep
+    # compatibility with older model/state_dict checkpoint conventions.
+    state = payload.get(
+        "model_state_dict",
+        payload.get("model", payload.get("state_dict", payload)),
+    )
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"No model state dictionary found in pretrained checkpoint: {checkpoint_path}"
+        )
     state = {key.removeprefix("module."): value for key, value in state.items()}
-    incompatible = croma.load_state_dict(state, strict=False)
+    try:
+        incompatible = croma.load_state_dict(state, strict=False)
+    except RuntimeError as error:
+        raise RuntimeError(
+            "Pretrained CROMA checkpoint is not compatible with the configured "
+            f"model dimensions/channels: {checkpoint_path}. Check patch_size, "
+            "num_patches, encoder_dim, radar_channels, and optical_channels."
+        ) from error
     return (
         f"{checkpoint_path} (missing={len(incompatible.missing_keys)}, "
         f"unexpected={len(incompatible.unexpected_keys)})"
