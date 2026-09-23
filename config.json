@@ -40,7 +40,7 @@
   },
   "croma": {
     "profile": "tiny_demo",
-    "patch_size": 1,
+    "patch_size": 8,
     "encoder_dim": 192,
     "encoder_layers": 6,
     "attention_heads": 16,
