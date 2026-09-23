@@ -175,6 +175,19 @@ At each paired contact it trains the two satellite encoders for
 station trains the shared cross encoder and segmentation head. Its timestamped
 results are written under `../standard_split_learning_demo/`.
 
+To run the complete-model FedAvg baseline, use:
+
+```powershell
+python fedavg_multimodal_demo.py
+```
+
+FedAvg treats one radar/optical pair in each orbital plane as one multimodal
+client. The client stores its radar encoder, optical encoder, cross encoder,
+and segmentation head, performs local training during disconnected periods,
+and exchanges the complete model at contact windows. The ground station
+performs uniform FedAvg over `segmentation_training.aggregation_k` clients.
+Results are written under `../fedavg_multimodal_demo/<timestamp>/`.
+
 `device=auto` selects `cuda:0` when CUDA PyTorch is available and otherwise
 uses CPU.
 
