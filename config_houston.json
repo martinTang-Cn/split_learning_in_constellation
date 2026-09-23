@@ -28,15 +28,15 @@
     "safety_margin_s": 1.0
   },
   "dataset": {
-    "name": "whu",
-    "root_dir": "~/data/whu-opt-sar-dataset",
+    "name": "houston",
+    "root_dir": "~/data/Houston2013",
     "train_ratio": 0.8,
     "stride_ratio": 0.9,
     "stride": null,
     "drop_empty": true,
     "normalize": true,
     "norm_type": "standard",
-    "num_ratio": 0.01
+    "num_ratio": 1.0
   },
   "croma": {
     "profile": "tiny_demo",
