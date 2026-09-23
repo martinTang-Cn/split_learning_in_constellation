@@ -188,6 +188,23 @@ and exchanges the complete model at contact windows. The ground station
 performs uniform FedAvg over `segmentation_training.aggregation_k` clients.
 Results are written under `../fedavg_multimodal_demo/<timestamp>/`.
 
+To run the projection-layer ablation, use:
+
+```powershell
+python multimodal_croma_no_projection_demo.py
+```
+
+This variant removes `projR`/`projO` completely. During a disconnected
+interval each satellite trains `encoder -> auxiliary segmentation head`
+directly on the encoder tokens, and the ground station trains only the cross
+encoder and ground head (no distillation MSE). Orbit scheduling, dataset
+partitioning, equal-weight aggregation of encoder/auxiliary states, and the
+evaluation protocol match `multimodal_croma_demo.py`, so the projection layer
+is the only experimental variable. Results are written under
+`../multimodal_croma_no_projection_demo/<timestamp>/`. The setting
+`segmentation_training.freeze_projection_during_disconnection` is ignored by
+this script because no projection layer exists.
+
 `device=auto` selects `cuda:0` when CUDA PyTorch is available and otherwise
 uses CPU.
 
