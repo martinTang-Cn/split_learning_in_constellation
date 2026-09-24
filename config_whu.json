@@ -28,19 +28,19 @@
     "safety_margin_s": 1.0
   },
   "dataset": {
-    "name": "houston",
-    "root_dir": "~/data/Houston2013",
+    "name": "whu",
+    "root_dir": "~/data/whu-opt-sar-dataset",
     "train_ratio": 0.8,
     "stride_ratio": 0.9,
     "stride": null,
     "drop_empty": true,
     "normalize": true,
     "norm_type": "standard",
-    "num_ratio": 1.0
+    "num_ratio": 0.01
   },
   "croma": {
     "profile": "tiny_demo",
-    "patch_size": 1,
+    "patch_size": 8,
     "encoder_dim": 192,
     "encoder_layers": 6,
     "attention_heads": 16,
