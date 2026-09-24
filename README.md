@@ -188,6 +188,24 @@ and exchanges the complete model at contact windows. The ground station
 performs uniform FedAvg over `segmentation_training.aggregation_k` clients.
 Results are written under `../fedavg_multimodal_demo/<timestamp>/`.
 
+To run the centralized full-model baseline, use:
+
+```powershell
+python centralized_multimodal_demo.py
+```
+
+One shared radar encoder, optical encoder, cross encoder, and segmentation
+head train end to end. The same paired contact windows and per-plane sample
+partitions set the data order. Each window requests
+`local_steps_per_disconnection + recent_smashed_batches` batches (40 with the
+current config), with no connectivity or communication constraint on the
+centralized model. The run log records both requested and actual batch counts.
+If configured epochs cannot supply the budget, the run raises an error rather
+than producing an unequal-batch comparison. The script reads
+`croma.pretrained_checkpoint`, or accepts
+`--pretrained-checkpoint`, and writes results under
+`../centralized_multimodal_demo/<timestamp>/`.
+
 To run the projection-layer ablation, use:
 
 ```powershell
