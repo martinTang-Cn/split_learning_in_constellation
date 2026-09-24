@@ -195,8 +195,8 @@ python centralized_multimodal_demo.py
 ```
 
 One shared radar encoder, optical encoder, cross encoder, and segmentation
-head train end to end. The same paired contact windows and per-plane sample
-partitions set the data order. Each window requests
+head train end to end on the complete training dataset. A single deterministic
+batch stream is consumed continuously across contact windows. Each window requests
 `local_steps_per_disconnection + recent_smashed_batches` batches (40 with the
 current config), with no connectivity or communication constraint on the
 centralized model. The run log records both requested and actual batch counts.

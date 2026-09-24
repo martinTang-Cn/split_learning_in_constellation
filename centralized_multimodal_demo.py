@@ -1,8 +1,8 @@
 """Centralized CROMA segmentation baseline paced by satellite contact windows.
 
-One shared model sees the same per-plane data partitions as the distributed
-experiments. Each paired contact schedules a fixed number of full-model updates;
-there are no satellite models, communication transactions, or aggregations.
+One shared model trains on the complete training dataset. Each paired contact
+schedules a fixed number of full-model updates; there are no satellite models,
+communication transactions, or aggregations.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from croma_models import PatchSegmentationHead, build_croma_components
-from multimodal_data import PairedBatchSequence, build_dataset_bundle, partition_dataset_indices
+from multimodal_data import PairedBatchSequence, build_dataset_bundle
 from multimodal_evaluation import evaluate_global, write_csv
 from multimodal_sfl import clone_state
 from orbit_model import parse_utc
@@ -42,18 +42,15 @@ def select_device(requested: str) -> torch.device:
     return device
 
 
-def make_pair_batches(pair_contacts, dataset, training):
-    """Match the original experiment's deterministic per-plane sample streams."""
-    planes = sorted({row["plane"] for row in pair_contacts})
-    pair_ids = [next(row["pair_id"] for row in pair_contacts if row["plane"] == plane) for plane in planes]
-    indices = partition_dataset_indices(len(dataset), pair_ids, int(training["seed"]))
-    return {
-        pair_id: PairedBatchSequence(
-            dataset, indices[pair_id], int(training["batch_size"]),
-            int(training["epochs"]), int(training["seed"]) + plane,
-        )
-        for plane, pair_id in zip(planes, pair_ids)
-    }
+def make_full_dataset_batches(dataset, training):
+    """Create one deterministic batch stream over the complete training set."""
+    return PairedBatchSequence(
+        dataset,
+        range(len(dataset)),
+        int(training["batch_size"]),
+        int(training["epochs"]),
+        int(training["seed"]),
+    )
 
 
 def run_training(config, raw_contacts, output_dir: Path):
@@ -64,7 +61,8 @@ def run_training(config, raw_contacts, output_dir: Path):
     device = select_device(training["device"])
     pair_contacts = build_pair_contacts(raw_contacts, parse_utc(config["simulation"]["epoch_utc"]))
     pair_count = len({row["pair_id"] for row in pair_contacts})
-    dataset_bundle = build_dataset_bundle(config, PROJECT_DIR, pair_count)
+    # Centralized training does not require a separate partition for each pair.
+    dataset_bundle = build_dataset_bundle(config, PROJECT_DIR, 1)
     metadata = dataset_bundle.metadata
     config["dataset_metadata"] = {
         "name": metadata.name,
@@ -91,29 +89,24 @@ def run_training(config, raw_contacts, output_dir: Path):
     budget = int(training["local_steps_per_disconnection"]) + int(training["recent_smashed_batches"])
     if budget <= 0:
         raise ValueError("The sum of local_steps_per_disconnection and recent_smashed_batches must be positive")
-    streams = make_pair_batches(pair_contacts, dataset_bundle.train, training)
-    contacts_per_pair = {
-        pair_id: sum(row["pair_id"] == pair_id for row in pair_contacts)
-        for pair_id in streams
-    }
-    for pair_id, stream in streams.items():
-        needed = budget * contacts_per_pair[pair_id]
-        if len(stream) < needed:
-            raise ValueError(
-                f"{pair_id} has only {len(stream)} planned batches for {needed} "
-                "required updates; increase segmentation_training.epochs"
-            )
-    cursors = {pair_id: 0 for pair_id in streams}
+    stream = make_full_dataset_batches(dataset_bundle.train, training)
+    required_batches = budget * len(pair_contacts)
+    if len(stream) < required_batches:
+        raise ValueError(
+            f"The complete training dataset provides only {len(stream)} planned "
+            f"batches for {required_batches} required updates; increase "
+            "segmentation_training.epochs"
+        )
+    cursor = 0
     contact_log, batch_log = [], []
 
     for contact in pair_contacts:
         pair_id = contact["pair_id"]
-        stream = streams[pair_id]
         losses = []
         ignored_batches = 0
-        while len(losses) < budget and cursors[pair_id] < len(stream):
-            batch_epoch, batch_number, sample_ids, radar, optical, labels = stream[cursors[pair_id]]
-            cursors[pair_id] += 1
+        while len(losses) < budget and cursor < len(stream):
+            batch_epoch, batch_number, sample_ids, radar, optical, labels = stream[cursor]
+            cursor += 1
             if not torch.any(labels != metadata.ignore_index):
                 ignored_batches += 1
                 continue
@@ -137,7 +130,7 @@ def run_training(config, raw_contacts, output_dir: Path):
 
         if len(losses) != budget:
             raise RuntimeError(
-                f"{pair_id} exhausted usable batches at {contact['pair_contact_id']} "
+                f"The complete training dataset exhausted usable batches at {contact['pair_contact_id']} "
                 f"after {len(losses)}/{budget} updates; increase "
                 "segmentation_training.epochs or inspect ignored labels"
             )
