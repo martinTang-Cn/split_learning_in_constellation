@@ -54,11 +54,11 @@
     "temperature": 2.0,
     "ground_teacher_weight": 0.5,
     "isl_mutual_weight": 0.25,
-    "confidence_threshold": 0.7,
-    "proximal_mu": 0.0001,
+    "confidence_threshold": 0.55,
+    "proximal_mu": 0.001,
     "teacher_replay_weight": 0.5,
     "teacher_replay_batches": 4,
-    "teacher_replay_frequency": 4
+    "teacher_replay_frequency": 2
   },
   "segmentation_training": {
     "seed": 42,
