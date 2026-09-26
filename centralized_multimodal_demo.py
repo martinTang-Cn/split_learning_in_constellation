@@ -86,7 +86,8 @@ def run_training(config, raw_contacts, output_dir: Path):
         {"params": head.parameters(), "lr": float(training["server_learning_rate"])},
     ], weight_decay=weight_decay)
 
-    budget = int(training["local_steps_per_disconnection"]) + int(training["recent_smashed_batches"])
+    # budget = int(training["local_steps_per_disconnection"]) + int(training["recent_smashed_batches"])
+    budget = int(training["local_steps_per_disconnection"])
     if budget <= 0:
         raise ValueError("The sum of local_steps_per_disconnection and recent_smashed_batches must be positive")
     stream = make_full_dataset_batches(dataset_bundle.train, training)
