@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from datetime import datetime
 import json
 from pathlib import Path
@@ -80,9 +81,15 @@ def make_plane_pairs(pair_contacts, global_states, config, dataset_bundle):
                 {key: value.clone() for key, value in global_states["radar_encoder"].items()},
                 {key: value.clone() for key, value in global_states["radar_auxiliary"].items()},
                 {key: value.clone() for key, value in global_states["radar_projection"].items()},
+                {key: value.clone() for key, value in global_states["radar_encoder"].items()},
+                {key: value.clone() for key, value in global_states["radar_auxiliary"].items()},
+                {key: value.clone() for key, value in global_states["radar_projection"].items()},
             ),
             optical=ModalityState(
                 example["optical_satellite_id"], "optical",
+                {key: value.clone() for key, value in global_states["optical_encoder"].items()},
+                {key: value.clone() for key, value in global_states["optical_auxiliary"].items()},
+                {key: value.clone() for key, value in global_states["optical_projection"].items()},
                 {key: value.clone() for key, value in global_states["optical_encoder"].items()},
                 {key: value.clone() for key, value in global_states["optical_auxiliary"].items()},
                 {key: value.clone() for key, value in global_states["optical_projection"].items()},
@@ -128,16 +135,24 @@ def run_training(config, raw_contacts, output_dir: Path):
     image_size = dataset_bundle.metadata.image_size
     # 模型组件:编码器模块全局共享,各卫星对通过换入/换出自己的 state_dict 区分(单机模拟多星)
     radar_worker, optical_worker, cross_encoder, attention_bias, checkpoint_status = build_croma_components(config, device, PROJECT_DIR)
+    # A frozen copy represents the last ground-synchronized teacher on each satellite.
+    radar_teacher_worker = copy.deepcopy(radar_worker).to(device)
+    optical_teacher_worker = copy.deepcopy(optical_worker).to(device)
     # 星上本地训练用的辅助分割头(雷达、光学)与地面分割头
     radar_auxiliary = PatchSegmentationHead(model_config["encoder_dim"], num_classes, model_config["num_patches"]).to(device)
     optical_auxiliary = PatchSegmentationHead(model_config["encoder_dim"], num_classes, model_config["num_patches"]).to(device)
     ground_head = PatchSegmentationHead(model_config["encoder_dim"], num_classes, model_config["num_patches"]).to(device)
+    radar_teacher_auxiliary = copy.deepcopy(radar_auxiliary).to(device)
+    optical_teacher_auxiliary = copy.deepcopy(optical_auxiliary).to(device)
     radar_projection = FeatureProjection(model_config["encoder_dim"]).to(device)
     optical_projection = FeatureProjection(model_config["encoder_dim"]).to(device)
+    radar_teacher_projection = copy.deepcopy(radar_projection).to(device)
+    optical_teacher_projection = copy.deepcopy(optical_projection).to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=dataset_bundle.metadata.ignore_index)
     # 地面端训练 cross encoder、地面头和两个特征投影层；投影层随后下发给对应卫星。
     server_optimizer = torch.optim.AdamW(
         list(cross_encoder.parameters()) + list(ground_head.parameters())
+        + list(radar_auxiliary.parameters()) + list(optical_auxiliary.parameters())
         + list(radar_projection.parameters()) + list(optical_projection.parameters()),
         lr=training["server_learning_rate"],
         weight_decay=float(training.get("weight_decay", 0.01)),
@@ -182,19 +197,31 @@ def run_training(config, raw_contacts, output_dir: Path):
             radar_worker, optical_worker, config, global_version
         )
         # 1) 窗口开始前:卫星对在不可见时段做星上本地训练,产出带版本号的特征包
-        train_pair_offline(pair, contact["start_offset_s"], config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
+        train_pair_offline(
+            pair, contact["start_offset_s"], config, radar_worker, optical_worker,
+            radar_auxiliary, optical_auxiliary, radar_projection, optical_projection,
+            radar_teacher_worker, optical_teacher_worker, radar_teacher_auxiliary,
+            optical_teacher_auxiliary, radar_teacher_projection, optical_teacher_projection,
+            attention_bias, criterion, device, epoch, local_log,
+        )
         # 2) 找到双模态缓冲区中可对齐融合的批次(batch_number 交集)
         matched_ids = pair.matched_batch_ids()
         # 本次事务是否会触发聚合(聚合耗时需计入事务时长估算)
         will_aggregate = len(pending) + 1 >= aggregation_k
         # 估算本次过站事务的传输字节数与总耗时(上行 + 传播 + 服务器计算 + 聚合 + 下行)
-        estimate = estimate_transaction(pair, matched_ids, contact, config, will_aggregate)
+        estimate = estimate_transaction(
+            pair, matched_ids, contact, config, will_aggregate,
+            include_teacher_packets=True,
+        )
         # 3) 排期:最早只能在窗口开始且地面站空闲后开始;截止时间预留安全余量
         start_s = max(contact["start_offset_s"], ground_available_s)
         finish_s = start_s + estimate["duration_s"]
         deadline_s = contact["end_offset_s"] - float(config["link"]["safety_margin_s"])
         status, reason = "completed", ""
-        losses = {"segmentation": [], "radar_distillation": [], "optical_distillation": []}
+        losses = {
+            "segmentation": [], "radar_distillation": [], "optical_distillation": [],
+            "radar_ground_teacher": [], "optical_ground_teacher": [],
+        }
         aggregation_members, aggregation_performed = "", False
         test_accuracy, test_miou = "", ""
         server_mean_loss = ""
@@ -207,7 +234,11 @@ def run_training(config, raw_contacts, output_dir: Path):
             status, reason = "skipped", "paired_transaction_does_not_fit_contact"
         else:
             # 5) 地面端:跨模态编码器 + 地面头在匹配特征上做监督训练
-            losses = train_server_on_matched_features(pair, matched_ids, cross_encoder, ground_head, radar_projection, optical_projection, attention_bias, server_optimizer, criterion, image_size, device)
+            losses = train_server_on_matched_features(
+                pair, matched_ids, cross_encoder, ground_head, radar_auxiliary,
+                optical_auxiliary, radar_projection, optical_projection,
+                attention_bias, server_optimizer, criterion, image_size, device, config,
+            )
             server_updates += len(losses["segmentation"])
             server_mean_loss = (
                 sum(losses["segmentation"]) / len(losses["segmentation"])
@@ -215,6 +246,11 @@ def run_training(config, raw_contacts, output_dir: Path):
             )
             global_states["radar_projection"] = clone_state(radar_projection)
             global_states["optical_projection"] = clone_state(optical_projection)
+            # The updated modality heads become the next disconnected-period teachers.
+            global_states["radar_auxiliary"] = clone_state(radar_auxiliary)
+            global_states["optical_auxiliary"] = clone_state(optical_auxiliary)
+            pair.radar.auxiliary_state = clone_state(radar_auxiliary)
+            pair.optical.auxiliary_state = clone_state(optical_auxiliary)
             # 该对上传的四份状态(雷达/光学编码器 + 辅助头)作为一次待聚合贡献
             pending.append(PairContribution(pair.pair_id, pair.radar.encoder_state, pair.radar.auxiliary_state, pair.optical.encoder_state, pair.optical.auxiliary_state))
             if len(pending) == aggregation_k:
@@ -272,6 +308,9 @@ def run_training(config, raw_contacts, output_dir: Path):
             "server_mean_loss": round(server_mean_loss, 8) if server_mean_loss != "" else "",
             "radar_distillation_mean_loss": round(sum(losses["radar_distillation"]) / len(losses["radar_distillation"]), 8) if losses["radar_distillation"] else "",
             "optical_distillation_mean_loss": round(sum(losses["optical_distillation"]) / len(losses["optical_distillation"]), 8) if losses["optical_distillation"] else "",
+            "radar_ground_teacher_mean_loss": round(sum(losses["radar_ground_teacher"]) / len(losses["radar_ground_teacher"]), 8) if losses["radar_ground_teacher"] else "",
+            "optical_ground_teacher_mean_loss": round(sum(losses["optical_ground_teacher"]) / len(losses["optical_ground_teacher"]), 8) if losses["optical_ground_teacher"] else "",
+            "ground_teacher_replay_batches": len(pair.ground_teacher_replay),
             "test_accuracy": test_accuracy, "test_miou": test_miou,
             "aggregation_performed": int(aggregation_performed), "aggregation_members": aggregation_members,
             "global_version": global_version, "modeled_transaction_s": round(estimate["duration_s"], 8),
@@ -281,7 +320,13 @@ def run_training(config, raw_contacts, output_dir: Path):
 
     # 主循环结束后:各对在剩余时间内完成剩余的本地训练(不再有新事务与聚合)
     for pair in pairs.values():
-        train_pair_offline(pair, horizon_s, config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
+        train_pair_offline(
+            pair, horizon_s, config, radar_worker, optical_worker,
+            radar_auxiliary, optical_auxiliary, radar_projection, optical_projection,
+            radar_teacher_worker, optical_teacher_worker, radar_teacher_auxiliary,
+            optical_teacher_auxiliary, radar_teacher_projection, optical_teacher_projection,
+            attention_bias, criterion, device, epoch, local_log,
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     # 输出全部日志:配对窗口 / 本地训练 / 过站事务 / 聚合事件
     write_csv(output_dir / "pair_contact_windows.csv", pair_contacts)
@@ -295,7 +340,7 @@ def run_training(config, raw_contacts, output_dir: Path):
     successful = sum(row["status"] == "completed" for row in contact_log)
     # 汇总统计信息(规模、成功率、聚合次数、精度指标等)
     summary = {
-        "algorithm": "paired multimodal CROMA SFL with ground feature distillation and without staleness weighting", "device": str(device),
+        "algorithm": "paired multimodal CROMA SFL with ground-teacher, ISL mutual distillation, proximal regularization, and uniform aggregation", "device": str(device),
         "croma_profile": model_config["profile"], "checkpoint": checkpoint_status, "image_size": image_size,
         "dataset": dataset_bundle.metadata.name,
         "train_samples": len(dataset_bundle.train),
@@ -315,6 +360,7 @@ def run_training(config, raw_contacts, output_dir: Path):
             "final_stage": encoder_stage,
         },
         "projection_distillation": "projR/projO MSE to detached cross_encoder features",
+        "disconnection_training": config.get("disconnection_training", {}),
         "pixel_accuracy": pixel_accuracy, "mean_iou": mean_iou, 
         # "confusion_matrix": confusion,
         "last_ground_transaction_utc": utc_at(epoch, ground_available_s),
