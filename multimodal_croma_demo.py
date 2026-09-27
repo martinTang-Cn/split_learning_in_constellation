@@ -13,6 +13,7 @@ import torch
 from torch import nn
 
 from croma_models import (
+    ContrastiveProjectionHead,
     FeatureProjection,
     PatchSegmentationHead,
     build_croma_components,
@@ -80,12 +81,14 @@ def make_plane_pairs(pair_contacts, global_states, config, dataset_bundle):
                 {key: value.clone() for key, value in global_states["radar_encoder"].items()},
                 {key: value.clone() for key, value in global_states["radar_auxiliary"].items()},
                 {key: value.clone() for key, value in global_states["radar_projection"].items()},
+                contrastive_state={key: value.clone() for key, value in global_states["radar_contrastive"].items()},
             ),
             optical=ModalityState(
                 example["optical_satellite_id"], "optical",
                 {key: value.clone() for key, value in global_states["optical_encoder"].items()},
                 {key: value.clone() for key, value in global_states["optical_auxiliary"].items()},
                 {key: value.clone() for key, value in global_states["optical_projection"].items()},
+                contrastive_state={key: value.clone() for key, value in global_states["optical_contrastive"].items()},
             ),
             batches=PairedBatchSequence(
                 dataset_bundle.train,
@@ -147,6 +150,18 @@ def run_training(config, raw_contacts, output_dir: Path):
     ground_head = PatchSegmentationHead(model_config["encoder_dim"], num_classes, model_config["num_patches"]).to(device)
     radar_projection = FeatureProjection(model_config["encoder_dim"]).to(device)
     optical_projection = FeatureProjection(model_config["encoder_dim"]).to(device)
+    contrastive_learning_enabled = bool(training.get("contrastive_learning_enabled", True))
+    contrastive_projection_dim = int(training.get("contrastive_projection_dim", model_config["encoder_dim"]))
+    contrastive_hidden_dim = int(training.get("contrastive_hidden_dim", model_config["encoder_dim"]))
+    if contrastive_learning_enabled:
+        radar_contrastive = ContrastiveProjectionHead(
+            model_config["encoder_dim"], contrastive_projection_dim, contrastive_hidden_dim
+        ).to(device)
+        optical_contrastive = ContrastiveProjectionHead(
+            model_config["encoder_dim"], contrastive_projection_dim, contrastive_hidden_dim
+        ).to(device)
+    else:
+        radar_contrastive = optical_contrastive = None
     criterion = nn.CrossEntropyLoss(ignore_index=dataset_bundle.metadata.ignore_index)
     # 地面端训练 cross encoder、地面头和两个特征投影层；投影层随后下发给对应卫星。
     server_optimizer = torch.optim.AdamW(
@@ -159,8 +174,10 @@ def run_training(config, raw_contacts, output_dir: Path):
     global_states = {
         "radar_encoder": clone_state(radar_worker), "radar_auxiliary": clone_state(radar_auxiliary),
         "radar_projection": clone_state(radar_projection),
+        "radar_contrastive": clone_state(radar_contrastive) if radar_contrastive is not None else {},
         "optical_encoder": clone_state(optical_worker), "optical_auxiliary": clone_state(optical_auxiliary),
         "optical_projection": clone_state(optical_projection),
+        "optical_contrastive": clone_state(optical_contrastive) if optical_contrastive is not None else {},
     }
     # 每个轨道面构建一个卫星对:本地状态副本 + 确定性批次流
     pairs = make_plane_pairs(pair_contacts, global_states, config, dataset_bundle)
@@ -195,7 +212,12 @@ def run_training(config, raw_contacts, output_dir: Path):
             radar_worker, optical_worker, config, global_version
         )
         # 1) 窗口开始前:卫星对在不可见时段做星上本地训练,产出带版本号的特征包
-        train_pair_offline(pair, contact["start_offset_s"], config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
+        train_pair_offline(
+            pair, contact["start_offset_s"], config, radar_worker, optical_worker,
+            radar_auxiliary, optical_auxiliary, radar_projection, optical_projection,
+            attention_bias, criterion, device, epoch, local_log,
+            radar_contrastive, optical_contrastive,
+        )
         # 2) 找到双模态缓冲区中可对齐融合的批次(batch_number 交集)
         matched_ids = pair.matched_batch_ids()
         # 本次事务是否会触发聚合(聚合耗时需计入事务时长估算)
@@ -239,7 +261,11 @@ def run_training(config, raw_contacts, output_dir: Path):
             global_states["radar_projection"] = clone_state(radar_projection)
             global_states["optical_projection"] = clone_state(optical_projection)
             # 该对上传的四份状态(雷达/光学编码器 + 辅助头)作为一次待聚合贡献
-            pending.append(PairContribution(pair.pair_id, pair.radar.encoder_state, pair.radar.auxiliary_state, pair.optical.encoder_state, pair.optical.auxiliary_state))
+            pending.append(PairContribution(
+                pair.pair_id, pair.radar.encoder_state, pair.radar.auxiliary_state,
+                pair.optical.encoder_state, pair.optical.auxiliary_state,
+                pair.radar.contrastive_state, pair.optical.contrastive_state,
+            ))
             if len(pending) == aggregation_k:
                 # 6) 凑满 k 个贡献:按模态做均匀算术平均(FedAvg),产生新的全局版本
                 aggregation_members = ";".join(item.pair_id for item in pending)
@@ -247,9 +273,11 @@ def run_training(config, raw_contacts, output_dir: Path):
                     "radar_encoder": average_states([item.radar_encoder_state for item in pending]),
                     "radar_auxiliary": average_states([item.radar_auxiliary_state for item in pending]),
                     "radar_projection": global_states["radar_projection"],
+                    "radar_contrastive": average_states([item.radar_contrastive_state for item in pending]),
                     "optical_encoder": average_states([item.optical_encoder_state for item in pending]),
                     "optical_auxiliary": average_states([item.optical_auxiliary_state for item in pending]),
                     "optical_projection": global_states["optical_projection"],
+                    "optical_contrastive": average_states([item.optical_contrastive_state for item in pending]),
                 }
                 global_version, aggregation_performed = global_version + 1, True
                 encoder_stage = configure_satellite_encoder_trainability(
@@ -306,7 +334,12 @@ def run_training(config, raw_contacts, output_dir: Path):
 
     # 主循环结束后:各对在剩余时间内完成剩余的本地训练(不再有新事务与聚合)
     for pair in pairs.values():
-        train_pair_offline(pair, horizon_s, config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
+        train_pair_offline(
+            pair, horizon_s, config, radar_worker, optical_worker,
+            radar_auxiliary, optical_auxiliary, radar_projection, optical_projection,
+            attention_bias, criterion, device, epoch, local_log,
+            radar_contrastive, optical_contrastive,
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     # 输出全部日志:配对窗口 / 本地训练 / 过站事务 / 聚合事件
     write_csv(output_dir / "pair_contact_windows.csv", pair_contacts)
@@ -351,6 +384,14 @@ def run_training(config, raw_contacts, output_dir: Path):
             "target": "cross_encoder EMA output" if ema_teacher_enabled else "detached student output",
         },
         "satellite_auxiliary_head": "one shared two-layer convolutional head for radar and optical branches",
+        "contrastive_learning": {
+            "enabled": contrastive_learning_enabled,
+            "loss_weight": float(training.get("contrastive_loss_weight", 0.1)),
+            "temperature": float(training.get("contrastive_temperature", 0.07)),
+            "projection_dim": contrastive_projection_dim,
+            "hidden_dim": contrastive_hidden_dim,
+            "objective": "symmetric in-batch InfoNCE over ISL-paired radar/optical embeddings",
+        },
         "pixel_accuracy": pixel_accuracy, "mean_iou": mean_iou, 
         # "confusion_matrix": confusion,
         "last_ground_transaction_utc": utc_at(epoch, ground_available_s),
@@ -359,7 +400,16 @@ def run_training(config, raw_contacts, output_dir: Path):
     with (output_dir / "multimodal_training_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
     # 保存最终检查点:全局模型状态 + 服务器端跨模态编码器与地面头
-    torch.save({"config": config, "global_version": global_version, "global_states": global_states, "cross_encoder_state": clone_state(cross_encoder), "cross_encoder_ema_teacher_state": clone_state(cross_encoder_ema_teacher) if cross_encoder_ema_teacher is not None else None, "ground_segmentation_head_state": clone_state(ground_head), "radar_projection_state": clone_state(radar_projection), "optical_projection_state": clone_state(optical_projection)}, output_dir / "multimodal_final_checkpoint.pt")
+    torch.save({
+        "config": config, "global_version": global_version, "global_states": global_states,
+        "cross_encoder_state": clone_state(cross_encoder),
+        "cross_encoder_ema_teacher_state": clone_state(cross_encoder_ema_teacher) if cross_encoder_ema_teacher is not None else None,
+        "ground_segmentation_head_state": clone_state(ground_head),
+        "radar_projection_state": clone_state(radar_projection),
+        "optical_projection_state": clone_state(optical_projection),
+        "radar_contrastive_state": clone_state(radar_contrastive) if radar_contrastive is not None else None,
+        "optical_contrastive_state": clone_state(optical_contrastive) if optical_contrastive is not None else None,
+    }, output_dir / "multimodal_final_checkpoint.pt")
     print(json.dumps(summary, indent=2))
     print(f"Pair contacts: {output_dir / 'pair_contact_windows.csv'}")
     print(f"Training log: {output_dir / 'multimodal_training_log.csv'}")

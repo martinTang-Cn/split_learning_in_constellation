@@ -68,6 +68,14 @@ physical satellites are logically parallel; a single GPU
 evaluates their tensor operations sequentially while their shared pair virtual
 clock advances by the slower branch's modeled compute time.
 
+The same disconnected batch also supports an ISL contrastive objective. Each
+encoder output is mean-pooled, passed through its modality-specific two-layer
+FFN, and L2-normalized. The radar and optical embeddings are exchanged over
+the assumed inter-satellite link and use symmetric in-batch InfoNCE: matching
+sample IDs are positives and the other samples in the batch are negatives.
+The contrastive heads are local trainable state and are included in the pair's
+upload, aggregation, and downlink state accounting.
+
 At reconnection, the pair uploads both encoder states, both auxiliary-head
 states, and the most recent matched feature batches. The ground station runs
 the trainable `cross_encoder` on the paired features and maintains a frozen

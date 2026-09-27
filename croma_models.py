@@ -32,6 +32,33 @@ class FeatureProjection(nn.Module):
         return self.network(features)
 
 
+class ContrastiveProjectionHead(nn.Module):
+    """Mean-pool encoder tokens, project them with an FFN, and L2-normalize."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        projection_dim: int | None = None,
+        hidden_dim: int | None = None,
+    ) -> None:
+        super().__init__()
+        projection_dim = projection_dim or feature_dim
+        hidden_dim = hidden_dim or feature_dim
+        self.ffn = nn.Sequential(
+            nn.Linear(feature_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, projection_dim),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        if tokens.ndim != 3:
+            raise ValueError(
+                f"Expected token features with shape (B, N, C), got {tuple(tokens.shape)}"
+            )
+        pooled = tokens.mean(dim=1)
+        return F.normalize(self.ffn(pooled), dim=-1)
+
+
 class PatchSegmentationHead(nn.Module):
     """Map CROMA patch tokens to a full-resolution mask with two convolutions."""
 

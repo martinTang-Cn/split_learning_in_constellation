@@ -30,6 +30,7 @@ class ModalityState:
     projection_state: dict[str, torch.Tensor]
     local_version: int = 0
     downloaded_global_version: int = 0
+    contrastive_state: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass
@@ -64,6 +65,8 @@ class PairContribution:
     radar_auxiliary_state: dict[str, torch.Tensor]
     optical_encoder_state: dict[str, torch.Tensor]
     optical_auxiliary_state: dict[str, torch.Tensor]
+    radar_contrastive_state: dict[str, torch.Tensor] = field(default_factory=dict)
+    optical_contrastive_state: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
 def tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -110,6 +113,30 @@ def annealed_value(start: float, end: float, step: int, anneal_steps: int) -> fl
     return float(start) + (float(end) - float(start)) * progress
 
 
+def symmetric_contrastive_loss(
+    radar_embeddings: torch.Tensor,
+    optical_embeddings: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Compute bidirectional in-batch InfoNCE for paired satellite embeddings."""
+    if temperature <= 0.0:
+        raise ValueError("contrastive_temperature must be positive")
+    if radar_embeddings.ndim != 2 or optical_embeddings.ndim != 2:
+        raise ValueError("Contrastive embeddings must have shape (batch, dimension)")
+    if radar_embeddings.shape != optical_embeddings.shape:
+        raise ValueError("Radar and optical contrastive embeddings must have the same shape")
+    if radar_embeddings.shape[0] < 2:
+        # A one-sample batch has no in-batch negative. Keep a connected zero so
+        # the caller can include this term without special-casing backward().
+        return (radar_embeddings.sum() + optical_embeddings.sum()) * 0.0
+    logits = radar_embeddings @ optical_embeddings.transpose(0, 1) / temperature
+    labels = torch.arange(logits.shape[0], device=logits.device)
+    return 0.5 * (
+        torch.nn.functional.cross_entropy(logits, labels)
+        + torch.nn.functional.cross_entropy(logits.transpose(0, 1), labels)
+    )
+
+
 def average_states(states: list[dict[str, torch.Tensor]]):
     if not states:
         raise ValueError("Cannot aggregate an empty list")
@@ -133,7 +160,8 @@ def _trainable_parameters(module):
 def train_pair_offline(
     pair: PlanePair, stop_time_s, config, radar_worker, optical_worker, radar_auxiliary,
     optical_auxiliary, radar_projection, optical_projection, attention_bias,
-    criterion, device, epoch, log_rows,
+    criterion, device, epoch, log_rows, radar_contrastive=None,
+    optical_contrastive=None,
 ):
     """Train both satellite branches during one pair's invisible interval."""
     training = config["segmentation_training"]
@@ -149,6 +177,10 @@ def train_pair_offline(
         optical_auxiliary.load_state_dict(pair.optical.auxiliary_state)
     radar_projection.load_state_dict(pair.radar.projection_state)
     optical_projection.load_state_dict(pair.optical.projection_state)
+    if radar_contrastive is not None and pair.radar.contrastive_state:
+        radar_contrastive.load_state_dict(pair.radar.contrastive_state)
+    if optical_contrastive is not None and pair.optical.contrastive_state:
+        optical_contrastive.load_state_dict(pair.optical.contrastive_state)
     freeze_projection = bool(training.get("freeze_projection_during_disconnection", True))
     radar_projection.requires_grad_(not freeze_projection)
     optical_projection.requires_grad_(not freeze_projection)
@@ -166,11 +198,25 @@ def train_pair_offline(
             {"params": _trainable_parameters(radar_projection), "lr": training["auxiliary_learning_rate"]},
             {"params": _trainable_parameters(optical_projection), "lr": training["auxiliary_learning_rate"]},
         ])
+    contrastive_enabled = bool(training.get("contrastive_learning_enabled", radar_contrastive is not None and optical_contrastive is not None))
+    if contrastive_enabled and (radar_contrastive is None or optical_contrastive is None):
+        raise ValueError("Contrastive learning requires both radar and optical projection heads")
+    if contrastive_enabled:
+        local_parameters.extend([
+            {"params": _trainable_parameters(radar_contrastive), "lr": training["auxiliary_learning_rate"]},
+            {"params": _trainable_parameters(optical_contrastive), "lr": training["auxiliary_learning_rate"]},
+        ])
     weight_decay = float(training.get("weight_decay", 0.01))
     local_optimizer = torch.optim.AdamW(local_parameters, weight_decay=weight_decay)
     step_s = max(float(training["radar_local_compute_s"]), float(training["optical_local_compute_s"]))
     buffer_limit = int(training["recent_smashed_batches"])
     image_size = int(config["croma"]["patch_size"]) * math.isqrt(int(config["croma"]["num_patches"]))
+    contrastive_temperature = float(training.get("contrastive_temperature", 0.07))
+    contrastive_weight = float(training.get("contrastive_loss_weight", 0.1))
+    if contrastive_enabled and contrastive_temperature <= 0.0:
+        raise ValueError("contrastive_temperature must be positive")
+    if contrastive_weight < 0.0:
+        raise ValueError("contrastive_loss_weight must be non-negative")
     completed = 0
     while completed < int(training["local_steps_per_disconnection"]) and pair.has_local_work and pair.local_clock_s + step_s <= stop_time_s:
         epoch_number, batch_number, sample_ids, radar, optical, labels = pair.take_batch()
@@ -180,17 +226,23 @@ def train_pair_offline(
         step_start = pair.local_clock_s
         local_optimizer.zero_grad()
         radar_tokens = radar_worker(radar, attention_bias, mask_info=None)
+        optical_tokens = optical_worker(optical, attention_bias, mask_info=None)
         radar_projected = radar_projection(radar_tokens)
+        optical_projected = optical_projection(optical_tokens)
         radar_loss = criterion(radar_auxiliary(radar_projected, image_size), labels_device)
-        radar_loss.backward()
+        optical_loss = criterion(optical_auxiliary(optical_projected, image_size), labels_device)
+        if contrastive_enabled:
+            radar_embedding = radar_contrastive(radar_tokens)
+            optical_embedding = optical_contrastive(optical_tokens)
+            contrastive_loss = symmetric_contrastive_loss(
+                radar_embedding, optical_embedding, contrastive_temperature
+            )
+        else:
+            contrastive_loss = radar_loss.new_zeros(())
+        total_loss = radar_loss + optical_loss + contrastive_weight * contrastive_loss
+        total_loss.backward()
         local_optimizer.step()
         pair.radar.local_version += 1
-        local_optimizer.zero_grad()
-        optical_tokens = optical_worker(optical, attention_bias, mask_info=None)
-        optical_projected = optical_projection(optical_tokens)
-        optical_loss = criterion(optical_auxiliary(optical_projected, image_size), labels_device)
-        optical_loss.backward()
-        local_optimizer.step()
         pair.optical.local_version += 1
         pair.radar_buffer[batch_number] = FeaturePacket(radar_tokens.detach().cpu().clone(), labels.clone(), sample_ids.clone(), batch_number, pair.radar.local_version)
         pair.optical_buffer[batch_number] = FeaturePacket(optical_tokens.detach().cpu().clone(), labels.clone(), sample_ids.clone(), batch_number, pair.optical.local_version)
@@ -205,6 +257,7 @@ def train_pair_offline(
             "start_utc": utc_at(epoch, step_start), "finish_utc": utc_at(epoch, pair.local_clock_s),
             "radar_auxiliary_loss": round(float(radar_loss.item()), 8),
             "optical_auxiliary_loss": round(float(optical_loss.item()), 8),
+            "contrastive_loss": round(float(contrastive_loss.item()), 8),
             "radar_local_version": pair.radar.local_version, "optical_local_version": pair.optical.local_version,
             "matched_buffered_batches": len(pair.matched_batch_ids()),
         })
@@ -214,6 +267,10 @@ def train_pair_offline(
     pair.optical.auxiliary_state = clone_state(optical_auxiliary)
     pair.radar.projection_state = clone_state(radar_projection)
     pair.optical.projection_state = clone_state(optical_projection)
+    if radar_contrastive is not None:
+        pair.radar.contrastive_state = clone_state(radar_contrastive)
+    if optical_contrastive is not None:
+        pair.optical.contrastive_state = clone_state(optical_contrastive)
 
 
 def _packet_bytes(packet: FeaturePacket, include_labels: bool) -> int:
@@ -227,8 +284,12 @@ def estimate_transaction(pair, matched_ids, contact, config, will_aggregate):
     overhead = int(link["protocol_overhead_bytes"])
     radar_up = state_nbytes(pair.radar.encoder_state) + state_nbytes(pair.radar.auxiliary_state) + sum(_packet_bytes(pair.radar_buffer[key], True) for key in matched_ids) + overhead
     optical_up = state_nbytes(pair.optical.encoder_state) + state_nbytes(pair.optical.auxiliary_state) + sum(_packet_bytes(pair.optical_buffer[key], False) for key in matched_ids) + overhead
+    radar_up += state_nbytes(pair.radar.contrastive_state)
+    optical_up += state_nbytes(pair.optical.contrastive_state)
     radar_down = state_nbytes(pair.radar.encoder_state) + state_nbytes(pair.radar.auxiliary_state) + state_nbytes(pair.radar.projection_state) + overhead
     optical_down = state_nbytes(pair.optical.encoder_state) + state_nbytes(pair.optical.auxiliary_state) + state_nbytes(pair.optical.projection_state) + overhead
+    radar_down += state_nbytes(pair.radar.contrastive_state)
+    optical_down += state_nbytes(pair.optical.contrastive_state)
     radar_upload_s, optical_upload_s = radar_up * 8 / (contact["uplink_mbps"] * 1e6), optical_up * 8 / (contact["uplink_mbps"] * 1e6)
     radar_download_s, optical_download_s = radar_down * 8 / (contact["downlink_mbps"] * 1e6), optical_down * 8 / (contact["downlink_mbps"] * 1e6)
     if training["paired_uplink_mode"] == "parallel_full_rate":
@@ -310,5 +371,9 @@ def reset_pair_from_global(pair, global_states, global_version):
     pair.optical.encoder_state = {key: value.clone() for key, value in global_states["optical_encoder"].items()}
     pair.optical.auxiliary_state = {key: value.clone() for key, value in global_states["optical_auxiliary"].items()}
     pair.optical.projection_state = {key: value.clone() for key, value in global_states["optical_projection"].items()}
+    if "radar_contrastive" in global_states:
+        pair.radar.contrastive_state = {key: value.clone() for key, value in global_states["radar_contrastive"].items()}
+    if "optical_contrastive" in global_states:
+        pair.optical.contrastive_state = {key: value.clone() for key, value in global_states["optical_contrastive"].items()}
     pair.radar.downloaded_global_version = global_version
     pair.optical.downloaded_global_version = global_version
