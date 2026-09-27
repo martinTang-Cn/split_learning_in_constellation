@@ -1,7 +1,7 @@
 {
   "simulation": {
     "epoch_utc": "2026-09-14T00:00:00Z",
-    "duration_hours": 90,
+    "duration_hours": 168,
     "orbit_sample_step_s": 30,
     "contact_detection_step_s": 5
   },
