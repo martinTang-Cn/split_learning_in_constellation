@@ -9,7 +9,8 @@ co-registered samples with one common semantic-segmentation mask.
 ```text
 Radar satellite                 Optical satellite
 radar_encoder                   optical_encoder
-projR -> radar auxiliary head   projO -> optical auxiliary head
+projR --+                        projO --+
+        +-> shared auxiliary segmentation head <-+
         |                               |
         +---------- patch tokens -------+
                         |
@@ -54,9 +55,9 @@ same batch and sample IDs.
 ## Disconnected training
 
 During invisible intervals, each satellite runs
-`encoder -> downloaded projection -> auxiliary segmentation head` on the same
-paired sample batch. The local optimizer always updates the encoder and the
-two-layer convolutional segmentation head, and can optionally update the
+`encoder -> downloaded projection -> shared auxiliary segmentation head` on the
+same paired sample batch. The local optimizer always updates the encoder and
+the two-layer convolutional segmentation head, and can optionally update the
 downloaded projection copy. This is
 controlled by `segmentation_training.freeze_projection_during_disconnection`,
 which defaults to `true`; when enabled, the projection remains in the forward
@@ -75,8 +76,8 @@ MSE, while the fused segmentation head keeps its supervised segmentation loss.
 After the transaction, the current `projR` and `projO` states are copied to the
 radar and optical satellites and are included in downlink-size accounting.
 Client aggregation remains an equal arithmetic mean for radar/optical encoder
-and auxiliary-head parameters; the ground projection layers are maintained at
-the server and are not overwritten by satellite-local updates.
+and shared auxiliary-head parameters; the ground projection layers are
+maintained at the server and are not overwritten by satellite-local updates.
 
 ## Demo profile and real data
 
@@ -213,7 +214,7 @@ python multimodal_croma_no_projection_demo.py
 ```
 
 This variant removes `projR`/`projO` completely. During a disconnected
-interval each satellite trains `encoder -> auxiliary segmentation head`
+interval each satellite trains `encoder -> shared auxiliary segmentation head`
 directly on the encoder tokens, and the ground station trains only the cross
 encoder and ground head (no distillation MSE). Orbit scheduling, dataset
 partitioning, equal-weight aggregation of encoder/auxiliary states, and the

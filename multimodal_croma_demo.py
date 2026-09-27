@@ -128,9 +128,10 @@ def run_training(config, raw_contacts, output_dir: Path):
     image_size = dataset_bundle.metadata.image_size
     # 模型组件:编码器模块全局共享,各卫星对通过换入/换出自己的 state_dict 区分(单机模拟多星)
     radar_worker, optical_worker, cross_encoder, attention_bias, checkpoint_status = build_croma_components(config, device, PROJECT_DIR)
-    # 星上本地训练用的辅助分割头(雷达、光学)与地面分割头
+    # 星上使用一份共享辅助头:雷达和光学 encoder 的输出依次更新同一组参数。
+    # 保留两个变量名是为了兼容现有训练接口,它们明确指向同一个模块。
     radar_auxiliary = PatchSegmentationHead(model_config["encoder_dim"], num_classes, model_config["num_patches"]).to(device)
-    optical_auxiliary = PatchSegmentationHead(model_config["encoder_dim"], num_classes, model_config["num_patches"]).to(device)
+    optical_auxiliary = radar_auxiliary
     ground_head = PatchSegmentationHead(model_config["encoder_dim"], num_classes, model_config["num_patches"]).to(device)
     radar_projection = FeatureProjection(model_config["encoder_dim"]).to(device)
     optical_projection = FeatureProjection(model_config["encoder_dim"]).to(device)
@@ -315,6 +316,7 @@ def run_training(config, raw_contacts, output_dir: Path):
             "final_stage": encoder_stage,
         },
         "projection_distillation": "projR/projO MSE to detached cross_encoder features",
+        "satellite_auxiliary_head": "one shared two-layer convolutional head for radar and optical branches",
         "pixel_accuracy": pixel_accuracy, "mean_iou": mean_iou, 
         # "confusion_matrix": confusion,
         "last_ground_transaction_utc": utc_at(epoch, ground_available_s),

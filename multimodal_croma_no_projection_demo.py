@@ -117,18 +117,19 @@ def train_pair_offline_no_projection(
     radar_worker.load_state_dict(pair.radar.encoder_state)
     optical_worker.load_state_dict(pair.optical.encoder_state)
     radar_auxiliary.load_state_dict(pair.radar.auxiliary_state)
-    optical_auxiliary.load_state_dict(pair.optical.auxiliary_state)
-    radar_parameters = [
+    if optical_auxiliary is not radar_auxiliary:
+        optical_auxiliary.load_state_dict(pair.optical.auxiliary_state)
+    local_parameters = [
         {"params": _trainable_parameters(radar_worker), "lr": training["encoder_learning_rate"]},
+        {"params": _trainable_parameters(optical_worker), "lr": training["encoder_learning_rate"]},
         {"params": _trainable_parameters(radar_auxiliary), "lr": training["auxiliary_learning_rate"]},
     ]
-    optical_parameters = [
-        {"params": _trainable_parameters(optical_worker), "lr": training["encoder_learning_rate"]},
-        {"params": _trainable_parameters(optical_auxiliary), "lr": training["auxiliary_learning_rate"]},
-    ]
+    if optical_auxiliary is not radar_auxiliary:
+        local_parameters.append(
+            {"params": _trainable_parameters(optical_auxiliary), "lr": training["auxiliary_learning_rate"]}
+        )
     weight_decay = float(training.get("weight_decay", 0.01))
-    radar_optimizer = torch.optim.AdamW(radar_parameters, weight_decay=weight_decay)
-    optical_optimizer = torch.optim.AdamW(optical_parameters, weight_decay=weight_decay)
+    local_optimizer = torch.optim.AdamW(local_parameters, weight_decay=weight_decay)
     step_s = max(float(training["radar_local_compute_s"]), float(training["optical_local_compute_s"]))
     buffer_limit = int(training["recent_smashed_batches"])
     image_size = int(config["croma"]["patch_size"]) * math.isqrt(int(config["croma"]["num_patches"]))
@@ -143,17 +144,17 @@ def train_pair_offline_no_projection(
             continue
         radar, optical, labels_device = radar.to(device), optical.to(device), labels.to(device)
         step_start = pair.local_clock_s
-        radar_optimizer.zero_grad()
+        local_optimizer.zero_grad()
         radar_tokens = radar_worker(radar, attention_bias, mask_info=None)
         radar_loss = criterion(radar_auxiliary(radar_tokens, image_size), labels_device)
         radar_loss.backward()
-        radar_optimizer.step()
+        local_optimizer.step()
         pair.radar.local_version += 1
-        optical_optimizer.zero_grad()
+        local_optimizer.zero_grad()
         optical_tokens = optical_worker(optical, attention_bias, mask_info=None)
         optical_loss = criterion(optical_auxiliary(optical_tokens, image_size), labels_device)
         optical_loss.backward()
-        optical_optimizer.step()
+        local_optimizer.step()
         pair.optical.local_version += 1
         pair.radar_buffer[batch_number] = FeaturePacket(
             radar_tokens.detach().cpu().clone(), labels.clone(), sample_ids.clone(),
@@ -178,8 +179,10 @@ def train_pair_offline_no_projection(
             "optical_local_version": pair.optical.local_version,
             "matched_buffered_batches": len(pair.matched_batch_ids()),
         })
-    pair.radar.encoder_state, pair.radar.auxiliary_state = clone_state(radar_worker), clone_state(radar_auxiliary)
-    pair.optical.encoder_state, pair.optical.auxiliary_state = clone_state(optical_worker), clone_state(optical_auxiliary)
+    shared_auxiliary_state = clone_state(radar_auxiliary)
+    pair.radar.encoder_state, pair.radar.auxiliary_state = clone_state(radar_worker), shared_auxiliary_state
+    pair.optical.encoder_state = clone_state(optical_worker)
+    pair.optical.auxiliary_state = clone_state(optical_auxiliary)
 
 
 def train_server_no_projection(
@@ -274,13 +277,12 @@ def run_training(config, raw_contacts, output_dir: Path):
     radar_worker, optical_worker, cross_encoder, attention_bias, checkpoint_status = build_croma_components(
         config, device, PROJECT_DIR
     )
-    # The auxiliary heads receive encoder tokens directly: no projR/projO.
+    # One auxiliary head is shared by both satellite modalities.  The
+    # ablation still consumes raw encoder tokens directly: no projR/projO.
     radar_auxiliary = PatchSegmentationHead(
         model_config["encoder_dim"], num_classes, model_config["num_patches"]
     ).to(device)
-    optical_auxiliary = PatchSegmentationHead(
-        model_config["encoder_dim"], num_classes, model_config["num_patches"]
-    ).to(device)
+    optical_auxiliary = radar_auxiliary
     ground_head = PatchSegmentationHead(
         model_config["encoder_dim"], num_classes, model_config["num_patches"]
     ).to(device)
@@ -439,7 +441,8 @@ def run_training(config, raw_contacts, output_dir: Path):
     successful = sum(row["status"] == "completed" for row in contact_log)
     summary = {
         "algorithm": "paired multimodal CROMA SFL without projection layers and without staleness weighting",
-        "projection_layers": "removed; satellite auxiliary heads consume encoder tokens directly",
+        "projection_layers": "removed; one shared satellite auxiliary head consumes encoder tokens directly",
+        "satellite_auxiliary_head": "one shared two-layer convolutional head for radar and optical branches",
         "ground_distillation": "disabled (no projR/projO MSE)",
         "device": str(device),
         "croma_profile": model_config["profile"], "checkpoint": checkpoint_status,
