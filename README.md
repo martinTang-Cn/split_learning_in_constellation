@@ -70,14 +70,25 @@ clock advances by the slower branch's modeled compute time.
 
 At reconnection, the pair uploads both encoder states, both auxiliary-head
 states, and the most recent matched feature batches. The ground station runs
-`cross_encoder` on the paired features and uses its output as a detached
-teacher: `projR(radar_feature)` and `projO(optical_feature)` are trained with
-MSE, while the fused segmentation head keeps its supervised segmentation loss.
+the trainable `cross_encoder` on the paired features and maintains a frozen
+EMA copy as the distillation teacher. `projR(radar_feature)` and
+`projO(optical_feature)` are trained with MSE against the EMA teacher output,
+while the fused segmentation head keeps its supervised segmentation loss.
+The teacher is updated after each server batch with
+`teacher = decay * teacher + (1 - decay) * cross_encoder`. The decay and
+distillation weight use linear annealing over server batches. The default
+schedule is decay `0.90 -> 0.99` and distillation weight `0.10 -> 1.00`, both
+over 100 server batches.
 After the transaction, the current `projR` and `projO` states are copied to the
 radar and optical satellites and are included in downlink-size accounting.
 Client aggregation remains an equal arithmetic mean for radar/optical encoder
 and shared auxiliary-head parameters; the ground projection layers are
 maintained at the server and are not overwritten by satellite-local updates.
+The EMA setting is controlled by `ema_teacher_enabled`,
+`ema_teacher_decay_start`, `ema_teacher_decay`, and
+`ema_teacher_anneal_steps`. Distillation weight annealing is controlled by
+`distillation_weight_start`, `distillation_weight_end`, and
+`distillation_anneal_steps`.
 
 ## Demo profile and real data
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 import math
 
@@ -75,6 +76,38 @@ def state_nbytes(state: dict[str, torch.Tensor]) -> int:
 
 def clone_state(module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu().clone() for key, value in module.state_dict().items()}
+
+
+def make_ema_teacher(student):
+    """Create a frozen teacher initialized from the current student weights."""
+    teacher = copy.deepcopy(student)
+    teacher.requires_grad_(False)
+    teacher.eval()
+    return teacher
+
+
+@torch.no_grad()
+def update_ema_teacher(teacher, student, decay: float) -> None:
+    """Move teacher parameters toward the updated student parameters."""
+    if not 0.0 <= decay < 1.0:
+        raise ValueError("ema_teacher_decay must be in the interval [0, 1)")
+    teacher_parameters = dict(teacher.named_parameters())
+    for name, student_parameter in student.named_parameters():
+        teacher_parameter = teacher_parameters[name]
+        teacher_parameter.mul_(decay).add_(student_parameter.detach(), alpha=1.0 - decay)
+    # Keep non-parameter buffers (if a future encoder adds any) synchronized.
+    teacher_buffers = dict(teacher.named_buffers())
+    for name, student_buffer in student.named_buffers():
+        teacher_buffers[name].copy_(student_buffer.detach())
+    teacher.eval()
+
+
+def annealed_value(start: float, end: float, step: int, anneal_steps: int) -> float:
+    """Linearly move from start to end over server update steps."""
+    if anneal_steps <= 0:
+        return float(end)
+    progress = min(max(float(step) / float(anneal_steps), 0.0), 1.0)
+    return float(start) + (float(end) - float(start)) * progress
 
 
 def average_states(states: list[dict[str, torch.Tensor]]):
@@ -217,27 +250,56 @@ def estimate_transaction(pair, matched_ids, contact, config, will_aggregate):
 def train_server_on_matched_features(
     pair, matched_ids, cross_encoder, ground_head, radar_projection,
     optical_projection, attention_bias, optimizer, criterion, image_size, device,
+    ema_teacher=None, ema_decay=0.99, ema_decay_start=None,
+    ema_decay_anneal_steps=0, distillation_weight_start=1.0,
+    distillation_weight_end=1.0, distillation_anneal_steps=0, server_step=0,
 ):
-    losses = {"segmentation": [], "radar_distillation": [], "optical_distillation": []}
+    losses = {
+        "segmentation": [], "radar_distillation": [], "optical_distillation": [],
+        "ema_teacher_decay": [], "distillation_weight": [],
+    }
     radar_projection.requires_grad_(True)
     optical_projection.requires_grad_(True)
-    for batch_id in matched_ids:
+    decay_start = float(ema_decay if ema_decay_start is None else ema_decay_start)
+    decay_end = float(ema_decay)
+    for batch_offset, batch_id in enumerate(matched_ids):
+        update_step = int(server_step) + batch_offset
+        current_decay = annealed_value(
+            decay_start, decay_end, update_step, int(ema_decay_anneal_steps)
+        )
+        current_distillation_weight = annealed_value(
+            float(distillation_weight_start), float(distillation_weight_end),
+            update_step, int(distillation_anneal_steps),
+        )
         radar_packet, optical_packet = pair.radar_buffer[batch_id], pair.optical_buffer[batch_id]
         if not torch.equal(radar_packet.sample_ids, optical_packet.sample_ids):
             raise RuntimeError(f"Unmatched sample IDs in pair {pair.pair_id}")
         optimizer.zero_grad()
         fused = cross_encoder(radar_packet.tokens.to(device), optical_packet.tokens.to(device), attention_bias)
+        if ema_teacher is None:
+            distillation_target = fused.detach()
+        else:
+            with torch.no_grad():
+                distillation_target = ema_teacher(
+                    radar_packet.tokens.to(device), optical_packet.tokens.to(device), attention_bias
+                )
         radar_features = radar_projection(radar_packet.tokens.to(device))
         optical_features = optical_projection(optical_packet.tokens.to(device))
         segmentation_loss = criterion(ground_head(fused, image_size), radar_packet.labels.to(device))
-        radar_distillation_loss = torch.nn.functional.mse_loss(radar_features, fused.detach())
-        optical_distillation_loss = torch.nn.functional.mse_loss(optical_features, fused.detach())
-        loss = segmentation_loss + radar_distillation_loss + optical_distillation_loss
+        radar_distillation_loss = torch.nn.functional.mse_loss(radar_features, distillation_target)
+        optical_distillation_loss = torch.nn.functional.mse_loss(optical_features, distillation_target)
+        loss = segmentation_loss + current_distillation_weight * (
+            radar_distillation_loss + optical_distillation_loss
+        )
         loss.backward()
         optimizer.step()
+        if ema_teacher is not None:
+            update_ema_teacher(ema_teacher, cross_encoder, current_decay)
         losses["segmentation"].append(float(segmentation_loss.item()))
         losses["radar_distillation"].append(float(radar_distillation_loss.item()))
         losses["optical_distillation"].append(float(optical_distillation_loss.item()))
+        losses["ema_teacher_decay"].append(current_decay)
+        losses["distillation_weight"].append(current_distillation_weight)
     return losses
 
 

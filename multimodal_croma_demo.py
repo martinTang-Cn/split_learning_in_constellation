@@ -27,7 +27,7 @@ from multimodal_data import (
 from multimodal_evaluation import evaluate_global, write_csv
 from multimodal_sfl import (
     ModalityState, PairContribution, PlanePair, average_states, clone_state,
-    estimate_transaction, reset_pair_from_global, train_pair_offline,
+    estimate_transaction, make_ema_teacher, reset_pair_from_global, train_pair_offline,
     train_server_on_matched_features,
 )
 from orbit_model import parse_utc
@@ -128,6 +128,18 @@ def run_training(config, raw_contacts, output_dir: Path):
     image_size = dataset_bundle.metadata.image_size
     # 模型组件:编码器模块全局共享,各卫星对通过换入/换出自己的 state_dict 区分(单机模拟多星)
     radar_worker, optical_worker, cross_encoder, attention_bias, checkpoint_status = build_croma_components(config, device, PROJECT_DIR)
+    ema_teacher_enabled = bool(training.get("ema_teacher_enabled", True))
+    ema_teacher_decay = float(training.get("ema_teacher_decay", 0.99))
+    ema_teacher_decay_start = float(training.get("ema_teacher_decay_start", ema_teacher_decay))
+    ema_teacher_anneal_steps = max(0, int(training.get("ema_teacher_anneal_steps", 0)))
+    distillation_weight_start = float(training.get("distillation_weight_start", 1.0))
+    distillation_weight_end = float(training.get("distillation_weight_end", 1.0))
+    distillation_anneal_steps = max(0, int(training.get("distillation_anneal_steps", 0)))
+    if ema_teacher_enabled and not all(0.0 <= value < 1.0 for value in (ema_teacher_decay_start, ema_teacher_decay)):
+        raise ValueError("ema_teacher_decay_start and ema_teacher_decay must be in the interval [0, 1)")
+    if distillation_weight_start < 0.0 or distillation_weight_end < 0.0:
+        raise ValueError("distillation weights must be non-negative")
+    cross_encoder_ema_teacher = make_ema_teacher(cross_encoder) if ema_teacher_enabled else None
     # 星上使用一份共享辅助头:雷达和光学 encoder 的输出依次更新同一组参数。
     # 保留两个变量名是为了兼容现有训练接口,它们明确指向同一个模块。
     radar_auxiliary = PatchSegmentationHead(model_config["encoder_dim"], num_classes, model_config["num_patches"]).to(device)
@@ -195,7 +207,10 @@ def run_training(config, raw_contacts, output_dir: Path):
         finish_s = start_s + estimate["duration_s"]
         deadline_s = contact["end_offset_s"] - float(config["link"]["safety_margin_s"])
         status, reason = "completed", ""
-        losses = {"segmentation": [], "radar_distillation": [], "optical_distillation": []}
+        losses = {
+            "segmentation": [], "radar_distillation": [], "optical_distillation": [],
+            "ema_teacher_decay": [], "distillation_weight": [],
+        }
         aggregation_members, aggregation_performed = "", False
         test_accuracy, test_miou = "", ""
         server_mean_loss = ""
@@ -208,7 +223,14 @@ def run_training(config, raw_contacts, output_dir: Path):
             status, reason = "skipped", "paired_transaction_does_not_fit_contact"
         else:
             # 5) 地面端:跨模态编码器 + 地面头在匹配特征上做监督训练
-            losses = train_server_on_matched_features(pair, matched_ids, cross_encoder, ground_head, radar_projection, optical_projection, attention_bias, server_optimizer, criterion, image_size, device)
+            losses = train_server_on_matched_features(
+                pair, matched_ids, cross_encoder, ground_head, radar_projection,
+                optical_projection, attention_bias, server_optimizer, criterion,
+                image_size, device, cross_encoder_ema_teacher, ema_teacher_decay,
+                ema_teacher_decay_start, ema_teacher_anneal_steps,
+                distillation_weight_start, distillation_weight_end,
+                distillation_anneal_steps, server_updates,
+            )
             server_updates += len(losses["segmentation"])
             server_mean_loss = (
                 sum(losses["segmentation"]) / len(losses["segmentation"])
@@ -273,6 +295,8 @@ def run_training(config, raw_contacts, output_dir: Path):
             "server_mean_loss": round(server_mean_loss, 8) if server_mean_loss != "" else "",
             "radar_distillation_mean_loss": round(sum(losses["radar_distillation"]) / len(losses["radar_distillation"]), 8) if losses["radar_distillation"] else "",
             "optical_distillation_mean_loss": round(sum(losses["optical_distillation"]) / len(losses["optical_distillation"]), 8) if losses["optical_distillation"] else "",
+            "ema_teacher_decay": round(sum(losses["ema_teacher_decay"]) / len(losses["ema_teacher_decay"]), 8) if losses["ema_teacher_decay"] else "",
+            "distillation_weight": round(sum(losses["distillation_weight"]) / len(losses["distillation_weight"]), 8) if losses["distillation_weight"] else "",
             "test_accuracy": test_accuracy, "test_miou": test_miou,
             "aggregation_performed": int(aggregation_performed), "aggregation_members": aggregation_members,
             "global_version": global_version, "modeled_transaction_s": round(estimate["duration_s"], 8),
@@ -315,7 +339,17 @@ def run_training(config, raw_contacts, output_dir: Path):
             "trainable_blocks_after_warmup": int(encoder_schedule["trainable_blocks"]),
             "final_stage": encoder_stage,
         },
-        "projection_distillation": "projR/projO MSE to detached cross_encoder features",
+        "projection_distillation": "projR/projO MSE to detached EMA cross_encoder features",
+        "ema_teacher": {
+            "enabled": ema_teacher_enabled,
+            "decay_start": ema_teacher_decay_start if ema_teacher_enabled else None,
+            "decay_end": ema_teacher_decay if ema_teacher_enabled else None,
+            "anneal_steps": ema_teacher_anneal_steps if ema_teacher_enabled else None,
+            "distillation_weight_start": distillation_weight_start,
+            "distillation_weight_end": distillation_weight_end,
+            "distillation_anneal_steps": distillation_anneal_steps,
+            "target": "cross_encoder EMA output" if ema_teacher_enabled else "detached student output",
+        },
         "satellite_auxiliary_head": "one shared two-layer convolutional head for radar and optical branches",
         "pixel_accuracy": pixel_accuracy, "mean_iou": mean_iou, 
         # "confusion_matrix": confusion,
@@ -325,7 +359,7 @@ def run_training(config, raw_contacts, output_dir: Path):
     with (output_dir / "multimodal_training_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
     # 保存最终检查点:全局模型状态 + 服务器端跨模态编码器与地面头
-    torch.save({"config": config, "global_version": global_version, "global_states": global_states, "cross_encoder_state": clone_state(cross_encoder), "ground_segmentation_head_state": clone_state(ground_head), "radar_projection_state": clone_state(radar_projection), "optical_projection_state": clone_state(optical_projection)}, output_dir / "multimodal_final_checkpoint.pt")
+    torch.save({"config": config, "global_version": global_version, "global_states": global_states, "cross_encoder_state": clone_state(cross_encoder), "cross_encoder_ema_teacher_state": clone_state(cross_encoder_ema_teacher) if cross_encoder_ema_teacher is not None else None, "ground_segmentation_head_state": clone_state(ground_head), "radar_projection_state": clone_state(radar_projection), "optical_projection_state": clone_state(optical_projection)}, output_dir / "multimodal_final_checkpoint.pt")
     print(json.dumps(summary, indent=2))
     print(f"Pair contacts: {output_dir / 'pair_contact_windows.csv'}")
     print(f"Training log: {output_dir / 'multimodal_training_log.csv'}")
