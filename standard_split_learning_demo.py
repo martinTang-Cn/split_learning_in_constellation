@@ -279,9 +279,14 @@ def run_training(config, raw_contacts, output_dir: Path):
     recent_batches = int(training["recent_smashed_batches"])
     if recent_batches <= 0:
         raise ValueError("segmentation_training.recent_smashed_batches must be positive")
+    aggregation_k = int(training["aggregation_k"])
+    if aggregation_k <= 0:
+        raise ValueError("segmentation_training.aggregation_k must be positive")
 
     contact_log, batch_log = [], []
     successful_contacts = 0
+    processed_windows = 0
+    last_evaluation = ("", "")
     for contact in pair_contacts:
         pair = pairs[contact["pair_id"]]
         radar_worker.load_state_dict(pair.radar.encoder_state)
@@ -315,10 +320,16 @@ def run_training(config, raw_contacts, output_dir: Path):
             status, reason = "completed", ""
         else:
             status, reason = "skipped", "dataset_exhausted"
-        accuracy, miou = evaluate_split_clients(
-            pairs, dataset_bundle.validation, radar_worker, optical_worker,
-            cross_encoder, segmentation_head, attention_bias, config, device,
-        ) if steps else ("", "")
+        processed_windows += 1
+        evaluation_performed = processed_windows % aggregation_k == 0
+        if evaluation_performed:
+            accuracy, miou = evaluate_split_clients(
+                pairs, dataset_bundle.validation, radar_worker, optical_worker,
+                cross_encoder, segmentation_head, attention_bias, config, device,
+            )
+            last_evaluation = (accuracy, miou)
+        else:
+            accuracy, miou = "", ""
         elapsed_s = time.perf_counter() - run_started_at
         contact_log.append({
             "pair_contact_id": contact["pair_contact_id"],
@@ -332,17 +343,28 @@ def run_training(config, raw_contacts, output_dir: Path):
             "mean_loss": round(sum(losses) / len(losses), 8) if losses else "",
             "test_accuracy": accuracy,
             "test_miou": miou,
+            "evaluation_performed": int(evaluation_performed),
+            "evaluation_window_count": processed_windows if evaluation_performed else "",
             "wall_runtime": f"[{int(elapsed_s // 60):02d}:{int(elapsed_s % 60):02d}]",
             "processing_s": round(time.perf_counter() - contact_start, 6),
         })
-        if steps:
+        if steps and evaluation_performed:
             print(
-                f"[split-contact] window_end_utc={contact['end_utc']} "
+                f"[split-evaluation] window_end_utc={contact['end_utc']} "
                 f"pair={pair.pair_id} batches={steps} "
                 f"mean_loss={sum(losses) / len(losses):.8f} "
                 f"test_accuracy={accuracy:.8f} test_miou={miou:.8f}",
                 flush=True,
             )
+
+    # Report the final model when the run ends between scheduled evaluations.
+    if processed_windows and processed_windows % aggregation_k:
+        final_accuracy, final_miou = evaluate_split_clients(
+            pairs, dataset_bundle.validation, radar_worker, optical_worker,
+            cross_encoder, segmentation_head, attention_bias, config, device,
+        )
+    else:
+        final_accuracy, final_miou = last_evaluation
 
     output_dir.mkdir(parents=True, exist_ok=True)
     write_csv(output_dir / "standard_split_training_log.csv", contact_log)
@@ -357,10 +379,13 @@ def run_training(config, raw_contacts, output_dir: Path):
         "successful_contacts": successful_contacts,
         "skipped_contacts": len(pair_contacts) - successful_contacts,
         "recent_smashed_batches": recent_batches,
+        "aggregation_k": aggregation_k,
+        "evaluation_cadence": f"every_{aggregation_k}_windows",
+        "evaluation_count": sum(row["evaluation_performed"] for row in contact_log),
         "satellite_encoder_training_mode": "full",
         "server_model": "cross_encoder + segmentation_head",
-        "final_test_accuracy": contact_log[-1]["test_accuracy"] if contact_log else "",
-        "final_test_miou": contact_log[-1]["test_miou"] if contact_log else "",
+        "final_test_accuracy": final_accuracy,
+        "final_test_miou": final_miou,
     }
     with (output_dir / "standard_split_training_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
