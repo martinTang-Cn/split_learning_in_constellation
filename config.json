@@ -1,7 +1,7 @@
 {
   "simulation": {
     "epoch_utc": "2026-09-14T00:00:00Z",
-    "duration_hours": 168,
+    "duration_hours": 90,
     "orbit_sample_step_s": 30,
     "contact_detection_step_s": 5
   },
@@ -28,19 +28,19 @@
     "safety_margin_s": 1.0
   },
   "dataset": {
-    "name": "houston",
-    "root_dir": "~/data/Houston2013",
+    "name": "whu",
+    "root_dir": "~/data/whu-opt-sar-dataset",
     "train_ratio": 0.8,
     "stride_ratio": 0.9,
     "stride": null,
     "drop_empty": true,
     "normalize": true,
     "norm_type": "standard",
-    "num_ratio": 1.0
+    "num_ratio": 0.01
   },
   "croma": {
     "profile": "tiny_demo",
-    "patch_size": 1,
+    "patch_size": 8,
     "encoder_dim": 192,
     "encoder_layers": 6,
     "attention_heads": 16,
@@ -53,7 +53,7 @@
     "seed": 42,
     "device": "cuda",
     "batch_size": 16,
-    "epochs": 400,
+    "epochs": 300,
     "encoder_learning_rate": 0.0001,
     "auxiliary_learning_rate": 0.0001,
     "server_learning_rate": 0.00005,
@@ -61,8 +61,8 @@
     "pretrained_encoder_warmup_aggregations": 5,
     "pretrained_encoder_trainable_blocks": 1,
     "freeze_projection_during_disconnection": true,
-    "local_steps_per_disconnection": 10,
-    "recent_smashed_batches": 10,
+    "local_steps_per_disconnection": 20,
+    "recent_smashed_batches": 20,
     "aggregation_k": 4,
     "radar_local_compute_s": 0.5,
     "optical_local_compute_s": 0.5,
