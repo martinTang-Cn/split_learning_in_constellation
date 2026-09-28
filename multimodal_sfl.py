@@ -180,7 +180,29 @@ def _packet_bytes(packet: FeaturePacket, include_labels: bool) -> int:
     return total + tensor_nbytes(packet.labels) if include_labels else total
 
 
-def estimate_transaction(pair, matched_ids, contact, config, will_aggregate):
+def _token_bytes(packet: FeaturePacket) -> int:
+    return tensor_nbytes(packet.tokens)
+
+
+def encoder_gradient_enabled(config) -> bool:
+    """Whether a contact returns the ground fusion gradient to the satellites."""
+    return bool(config["segmentation_training"].get("encoder_gradient_from_server", False))
+
+
+def satellite_backward_compute_s(config) -> float:
+    """Modeled on-board forward/backward cost of one returned-gradient batch."""
+    return float(config["segmentation_training"].get("satellite_backward_compute_s_per_batch", 0.2))
+
+
+def batch_number_positions(batches) -> dict[int, int]:
+    """Map deterministic batch numbers to positions in a paired batch stream."""
+    specs = getattr(batches, "batch_specs", None)
+    if specs is not None:
+        return {int(number): position for position, (_, number, _) in enumerate(specs)}
+    return {int(batch[1]): position for position, batch in enumerate(batches)}
+
+
+def estimate_transaction(pair, matched_ids, contact, config, will_aggregate, encoder_gradient=False):
     """Calculate one paired satellite-ground transaction on parallel links."""
     link, training = config["link"], config["segmentation_training"]
     overhead = int(link["protocol_overhead_bytes"])
@@ -197,12 +219,32 @@ def estimate_transaction(pair, matched_ids, contact, config, will_aggregate):
     propagation_s = 2 * contact["min_slant_range_km"] / SPEED_OF_LIGHT_KM_S
     server_s = len(matched_ids) * float(training["server_compute_s_per_batch"])
     aggregation_s = float(training["aggregation_compute_s"]) if will_aggregate else 0.0
+    # Returning the fusion gradient costs one downlink of token-sized gradients
+    # plus the on-board recomputation and backward pass that turn them into
+    # encoder updates.  Both satellites receive their own gradient in parallel,
+    # so this follows the same uplink/download rule as the state exchange.
+    if encoder_gradient:
+        radar_gradient = sum(_token_bytes(pair.radar_buffer[key]) for key in matched_ids) + overhead
+        optical_gradient = sum(_token_bytes(pair.optical_buffer[key]) for key in matched_ids) + overhead
+        radar_gradient_s = radar_gradient * 8 / (contact["downlink_mbps"] * 1e6)
+        optical_gradient_s = optical_gradient * 8 / (contact["downlink_mbps"] * 1e6)
+        if training["paired_uplink_mode"] == "parallel_full_rate":
+            gradient_download_s = max(radar_gradient_s, optical_gradient_s)
+        else:
+            gradient_download_s = radar_gradient_s + optical_gradient_s
+        gradient_down = radar_gradient + optical_gradient
+        satellite_backward_s = len(matched_ids) * satellite_backward_compute_s(config)
+    else:
+        gradient_down, gradient_download_s, satellite_backward_s = 0, 0.0, 0.0
+    download_s += gradient_download_s
     return {
         "radar_upload_bytes": radar_up, "optical_upload_bytes": optical_up,
         "radar_download_bytes": radar_down, "optical_download_bytes": optical_down,
+        "gradient_download_bytes": gradient_down,
         "upload_s": upload_s, "download_s": download_s, "propagation_s": propagation_s,
-        "server_s": server_s, "aggregation_s": aggregation_s,
-        "duration_s": upload_s + propagation_s + server_s + aggregation_s + download_s,
+        "server_s": server_s, "satellite_backward_s": satellite_backward_s,
+        "aggregation_s": aggregation_s,
+        "duration_s": upload_s + propagation_s + server_s + satellite_backward_s + aggregation_s + download_s,
     }
 
 
@@ -227,6 +269,80 @@ def train_server_on_matched_features(
         loss = segmentation_loss + radar_distillation_loss + optical_distillation_loss
         loss.backward()
         optimizer.step()
+        losses["segmentation"].append(float(segmentation_loss.item()))
+        losses["radar_distillation"].append(float(radar_distillation_loss.item()))
+        losses["optical_distillation"].append(float(optical_distillation_loss.item()))
+    return losses
+
+
+def train_split_contact_step(
+    pair, matched_ids, batch_positions, config, radar_worker, optical_worker,
+    cross_encoder, ground_head, radar_projection, optical_projection,
+    attention_bias, server_optimizer, criterion, image_size, device,
+):
+    """Run one joint split-learning step per matched batch inside a contact.
+
+    The satellites recompute the smashed features from the raw batch so the
+    encoder graph is alive, the ground station evaluates the fusion loss, and
+    the gradient with respect to the smashed features travels back over the
+    split boundary.  The satellite encoders and the ground modules are then
+    updated together by the same fusion objective, which is what the buffered
+    feature path cannot do because its tokens are detached.
+    """
+    training = config["segmentation_training"]
+    radar_projection.requires_grad_(True)
+    optical_projection.requires_grad_(True)
+    weight_decay = float(training.get("weight_decay", 0.01))
+    radar_parameters = _trainable_parameters(radar_worker)
+    optical_parameters = _trainable_parameters(optical_worker)
+    radar_optimizer = (
+        torch.optim.AdamW(radar_parameters, lr=training["encoder_learning_rate"], weight_decay=weight_decay)
+        if radar_parameters else None
+    )
+    optical_optimizer = (
+        torch.optim.AdamW(optical_parameters, lr=training["encoder_learning_rate"], weight_decay=weight_decay)
+        if optical_parameters else None
+    )
+    radar_worker.load_state_dict(pair.radar.encoder_state)
+    optical_worker.load_state_dict(pair.optical.encoder_state)
+    losses = {"segmentation": [], "radar_distillation": [], "optical_distillation": [], "encoder_updates": 0}
+    for batch_id in matched_ids:
+        _, _, _, radar, optical, labels = pair.batches[batch_positions[batch_id]]
+        if not torch.any(labels != criterion.ignore_index):
+            continue
+        radar, optical, labels = radar.to(device), optical.to(device), labels.to(device)
+        server_optimizer.zero_grad()
+        if radar_optimizer is not None:
+            radar_optimizer.zero_grad()
+        if optical_optimizer is not None:
+            optical_optimizer.zero_grad()
+        radar_tokens = radar_worker(radar, attention_bias, mask_info=None)
+        optical_tokens = optical_worker(optical, attention_bias, mask_info=None)
+        radar_smashed = radar_tokens.detach().requires_grad_(True)
+        optical_smashed = optical_tokens.detach().requires_grad_(True)
+        fused = cross_encoder(radar_smashed, optical_smashed, attention_bias)
+        segmentation_loss = criterion(ground_head(fused, image_size), labels)
+        radar_distillation_loss = torch.nn.functional.mse_loss(radar_projection(radar_smashed), fused.detach())
+        optical_distillation_loss = torch.nn.functional.mse_loss(optical_projection(optical_smashed), fused.detach())
+        (segmentation_loss + radar_distillation_loss + optical_distillation_loss).backward()
+        radar_feature_grad = radar_smashed.grad.detach()
+        optical_feature_grad = optical_smashed.grad.detach()
+        server_optimizer.step()
+        # Only the gradients at the split boundary cross back to the satellites.
+        backward_tensors, backward_grads = [], []
+        if radar_optimizer is not None:
+            backward_tensors.append(radar_tokens)
+            backward_grads.append(radar_feature_grad)
+        if optical_optimizer is not None:
+            backward_tensors.append(optical_tokens)
+            backward_grads.append(optical_feature_grad)
+        if backward_tensors:
+            torch.autograd.backward(tuple(backward_tensors), tuple(backward_grads))
+            if radar_optimizer is not None:
+                radar_optimizer.step()
+            if optical_optimizer is not None:
+                optical_optimizer.step()
+            losses["encoder_updates"] += 1
         losses["segmentation"].append(float(segmentation_loss.item()))
         losses["radar_distillation"].append(float(radar_distillation_loss.item()))
         losses["optical_distillation"].append(float(optical_distillation_loss.item()))
