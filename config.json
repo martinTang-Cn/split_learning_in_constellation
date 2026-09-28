@@ -68,8 +68,6 @@
     "optical_local_compute_s": 0.5,
     "server_compute_s_per_batch": 0.2,
     "aggregation_compute_s": 0.05,
-    "paired_uplink_mode": "parallel_full_rate",
-    "encoder_gradient_from_server": true,
-    "satellite_backward_compute_s_per_batch": 0.2
+    "paired_uplink_mode": "parallel_full_rate"
   }
 }

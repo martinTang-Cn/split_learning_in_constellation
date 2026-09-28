@@ -26,10 +26,9 @@ from multimodal_data import (
 )
 from multimodal_evaluation import evaluate_global, write_csv
 from multimodal_sfl import (
-    ModalityState, PairContribution, PlanePair, average_states, batch_number_positions,
-    clone_state, encoder_gradient_enabled, estimate_transaction, reset_pair_from_global,
-    satellite_backward_compute_s, train_pair_offline, train_server_on_matched_features,
-    train_split_contact_step,
+    ModalityState, PairContribution, PlanePair, average_states, clone_state,
+    estimate_transaction, reset_pair_from_global, train_pair_offline,
+    train_server_on_matched_features,
 )
 from orbit_model import parse_utc
 from pair_contact_scheduler import build_pair_contacts, load_raw_contacts, utc_at
@@ -175,15 +174,6 @@ def run_training(config, raw_contacts, output_dir: Path):
     # ground_available_s:地面站最早可用时刻(串行独占资源)
     # global_version:全局模型版本号;server_updates:服务器累计训练步数
     ground_available_s, global_version, server_updates = 0.0, 0, 0
-    # encoder_gradient_from_server:过站时是否把地面端融合梯度回传并更新卫星 encoder
-    encoder_backprop = encoder_gradient_enabled(config)
-    batch_positions = {pair_id: batch_number_positions(pair.batches) for pair_id, pair in pairs.items()}
-    if encoder_backprop:
-        print(
-            "[encoder-gradient] 地面端融合梯度将回传并更新卫星 encoder "
-            f"satellite_backward_compute_s_per_batch={satellite_backward_compute_s(config)}",
-            flush=True,
-        )
     # 离散事件主循环:按时间顺序处理每个配对可见窗口
     for contact in pair_contacts:
         pair: PlanePair = pairs[contact["pair_id"]]
@@ -198,7 +188,7 @@ def run_training(config, raw_contacts, output_dir: Path):
         # 本次事务是否会触发聚合(聚合耗时需计入事务时长估算)
         will_aggregate = len(pending) + 1 >= aggregation_k
         # 估算本次过站事务的传输字节数与总耗时(上行 + 传播 + 服务器计算 + 聚合 + 下行)
-        estimate = estimate_transaction(pair, matched_ids, contact, config, will_aggregate, encoder_gradient=encoder_backprop)
+        estimate = estimate_transaction(pair, matched_ids, contact, config, will_aggregate)
         # 3) 排期:最早只能在窗口开始且地面站空闲后开始;截止时间预留安全余量
         start_s = max(contact["start_offset_s"], ground_available_s)
         finish_s = start_s + estimate["duration_s"]
@@ -208,7 +198,6 @@ def run_training(config, raw_contacts, output_dir: Path):
         aggregation_members, aggregation_performed = "", False
         test_accuracy, test_miou = "", ""
         server_mean_loss = ""
-        encoder_updates = 0
         # 4) 三种跳过情形:无匹配特征 / 地面站忙到窗口断开 / 事务放不进窗口
         if not matched_ids:
             status, reason = "skipped", "no_matched_multimodal_features"
@@ -217,22 +206,8 @@ def run_training(config, raw_contacts, output_dir: Path):
         elif finish_s > deadline_s:
             status, reason = "skipped", "paired_transaction_does_not_fit_contact"
         else:
-            # 5) 过站:地面端在匹配批次上训练。开启梯度回传时,卫星在窗口内依据
-            #    原始数据重算 smashed 特征,地面端回传融合损失的梯度,卫星 encoder
-            #    与地面端模块由同一个融合目标联合更新;否则只训练地面端模块。
-            if encoder_backprop:
-                losses = train_split_contact_step(
-                    pair, matched_ids, batch_positions[pair.pair_id], config,
-                    radar_worker, optical_worker, cross_encoder, ground_head,
-                    radar_projection, optical_projection, attention_bias,
-                    server_optimizer, criterion, image_size, device,
-                )
-                # 星上参数已被融合梯度更新,写回该卫星对状态供聚合使用
-                pair.radar.encoder_state = clone_state(radar_worker)
-                pair.optical.encoder_state = clone_state(optical_worker)
-                encoder_updates = int(losses["encoder_updates"])
-            else:
-                losses = train_server_on_matched_features(pair, matched_ids, cross_encoder, ground_head, radar_projection, optical_projection, attention_bias, server_optimizer, criterion, image_size, device)
+            # 5) 地面端:跨模态编码器 + 地面头在匹配特征上做监督训练
+            losses = train_server_on_matched_features(pair, matched_ids, cross_encoder, ground_head, radar_projection, optical_projection, attention_bias, server_optimizer, criterion, image_size, device)
             server_updates += len(losses["segmentation"])
             server_mean_loss = (
                 sum(losses["segmentation"]) / len(losses["segmentation"])
@@ -295,9 +270,6 @@ def run_training(config, raw_contacts, output_dir: Path):
             "radar_upload_bytes": estimate["radar_upload_bytes"], "optical_upload_bytes": estimate["optical_upload_bytes"],
             "server_updates": len(losses["segmentation"]),
             "server_mean_loss": round(server_mean_loss, 8) if server_mean_loss != "" else "",
-            "encoder_gradient": int(encoder_backprop), "encoder_updates": encoder_updates,
-            "gradient_download_bytes": estimate["gradient_download_bytes"],
-            "satellite_backward_s": round(estimate["satellite_backward_s"], 8),
             "radar_distillation_mean_loss": round(sum(losses["radar_distillation"]) / len(losses["radar_distillation"]), 8) if losses["radar_distillation"] else "",
             "optical_distillation_mean_loss": round(sum(losses["optical_distillation"]) / len(losses["optical_distillation"]), 8) if losses["optical_distillation"] else "",
             "test_accuracy": test_accuracy, "test_miou": test_miou,
@@ -343,14 +315,6 @@ def run_training(config, raw_contacts, output_dir: Path):
             "final_stage": encoder_stage,
         },
         "projection_distillation": "projR/projO MSE to detached cross_encoder features",
-        "encoder_gradient_from_server": encoder_backprop,
-        "encoder_updates": sum(row["encoder_updates"] for row in contact_log),
-        "satellite_backward_compute_s_per_batch": float(training.get("satellite_backward_compute_s_per_batch", 0.0)),
-        "contact_training": (
-            "satellite encoders receive the ground fusion gradient during contact"
-            if encoder_backprop else
-            "ground fusion model trains on detached buffered smashed features"
-        ),
         "pixel_accuracy": pixel_accuracy, "mean_iou": mean_iou, 
         # "confusion_matrix": confusion,
         "last_ground_transaction_utc": utc_at(epoch, ground_available_s),

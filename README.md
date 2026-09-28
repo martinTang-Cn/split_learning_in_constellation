@@ -141,25 +141,6 @@ then unfreezes only the last `pretrained_encoder_trainable_blocks` Transformer
 blocks, and `full` trains all satellite encoder parameters throughout. The
 default is `staged`.
 
-`segmentation_training.encoder_gradient_from_server` selects what a contact
-window does. With `false`, the ground station trains the cross encoder, ground
-head, and projections on the smashed features uploaded by the satellites, so
-the satellite encoders never see the fusion objective because those tokens are
-detached. With `true`, each matched batch is recomputed on board during the
-contact and the window runs a joint split-learning step: the ground station
-evaluates the fusion loss, returns the gradient with respect to the smashed
-features, and the satellite encoders are updated together with the ground
-modules by that same objective. The returned gradients are counted on the
-downlink, and
-`segmentation_training.satellite_backward_compute_s_per_batch` accounts for the
-on-board recomputation and backward pass of one batch in the modeled
-transaction time. The offline local path (`encoder -> projection -> auxiliary
-head`) is unchanged in both settings. Because the window transaction becomes
-longer, some marginal contacts can move from `completed` to
-`paired_transaction_does_not_fit_contact`; the per-window log records
-`encoder_gradient`, `encoder_updates`, `gradient_download_bytes`, and
-`satellite_backward_s` so the two settings stay comparable.
-
 ## Run
 
 ```powershell
