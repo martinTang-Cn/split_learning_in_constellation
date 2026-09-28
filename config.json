@@ -36,7 +36,7 @@
     "drop_empty": true,
     "normalize": true,
     "norm_type": "standard",
-    "num_ratio": 0.01
+    "num_ratio": 0.005
   },
   "croma": {
     "profile": "tiny_demo",
