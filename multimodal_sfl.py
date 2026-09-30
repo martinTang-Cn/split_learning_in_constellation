@@ -42,6 +42,7 @@ class PlanePair:
     local_clock_s: float = 0.0
     radar_buffer: dict[int, FeaturePacket] = field(default_factory=dict)
     optical_buffer: dict[int, FeaturePacket] = field(default_factory=dict)
+    prototype_bank: torch.Tensor | None = None
 
     @property
     def has_local_work(self) -> bool:

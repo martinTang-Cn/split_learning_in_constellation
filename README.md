@@ -218,10 +218,21 @@ directly on the encoder tokens, and the ground station trains only the cross
 encoder and ground head (no distillation MSE). Orbit scheduling, dataset
 partitioning, equal-weight aggregation of encoder/auxiliary states, and the
 evaluation protocol match `multimodal_croma_demo.py`, so the projection layer
-is the only experimental variable. Results are written under
+is removed while optional prototype supervision is controlled independently.
+Results are written under
 `../multimodal_croma_no_projection_demo/<timestamp>/`. The setting
 `segmentation_training.freeze_projection_during_disconnection` is ignored by
 this script because no projection layer exists.
+
+The no-projection version can additionally maintain a server-side class
+prototype bank. After each successful contact, the ground station updates one
+normalized prototype per semantic class from fused cross-encoder tokens and
+the ground-truth mask. During the next disconnected interval, each satellite
+uses cosine-similarity classification against the downloaded prototypes as an
+auxiliary encoder loss. The prototypes are server state rather than satellite
+network modules, so the satellite still contains only its encoder and local
+segmentation head. Configure this with `prototype_learning_enabled`,
+`prototype_temperature`, `prototype_loss_weight`, and `prototype_momentum`.
 
 `device=auto` selects `cuda:0` when CUDA PyTorch is available and otherwise
 uses CPU.

@@ -10,8 +10,8 @@ Relation to ``multimodal_croma_demo.py``:
   trains ``cross_encoder + ground_head`` with the segmentation loss only.
 * Orbit scheduling, dataset partitioning, contact-window bookkeeping, the
   equal-weight aggregation of encoder/auxiliary states, and the evaluation
-  protocol are unchanged, so the projection layer is the only experimental
-  variable.
+  protocol are unchanged. Optional class prototypes supervise the satellite
+  encoders; disable prototype_learning_enabled for the original ablation.
 
 ``segmentation_training.freeze_projection_during_disconnection`` is ignored by
 this script because no projection layer exists.
@@ -29,6 +29,7 @@ import time
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from croma_models import (
     PatchSegmentationHead,
@@ -58,8 +59,7 @@ from pair_contact_scheduler import build_pair_contacts, load_raw_contacts, utc_a
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_RUNS_DIR = PROJECT_DIR.parent / "multimodal_croma_no_projection_demo"
 
-# Same columns as the projection-based demo so the two logs can be compared
-# line by line; the distillation columns stay empty by construction.
+# Retain the original contact columns and add prototype download diagnostics.
 CONTACT_LOG_FIELDS = [
     "pair_contact_id", "pair_id", "radar_satellite_id", "optical_satellite_id",
     "direct_satellites", "contact_start_utc", "contact_end_utc",
@@ -67,9 +67,113 @@ CONTACT_LOG_FIELDS = [
     "matched_batches", "radar_upload_bytes", "optical_upload_bytes",
     "server_updates", "server_mean_loss",
     "radar_distillation_mean_loss", "optical_distillation_mean_loss",
+    "prototype_downlink_bytes",
+    "prototype_bank_version", "prototype_active_classes",
     "test_accuracy", "test_miou", "aggregation_performed",
     "aggregation_members", "global_version", "modeled_transaction_s",
 ]
+
+
+def _token_labels(
+    labels: torch.Tensor, num_patches: int, ignore_index: int, num_classes: int,
+) -> torch.Tensor:
+    """Assign each token the majority valid class in its image patch.
+
+    Ignored pixels do not vote. A patch containing no valid pixels remains
+    ignored, including sparse Houston labels and all-ignore WHU patches.
+    """
+    grid_size = math.isqrt(int(num_patches))
+    if grid_size * grid_size != int(num_patches):
+        raise ValueError("num_patches must be a perfect square for prototype supervision")
+    batch_size, height, width = labels.shape
+    if height % grid_size or width % grid_size:
+        raise ValueError("Label dimensions must be divisible by the token grid size")
+    patches = labels.reshape(
+        batch_size, grid_size, height // grid_size, grid_size, width // grid_size
+    ).permute(0, 1, 3, 2, 4).reshape(batch_size, num_patches, -1)
+    valid = patches.ne(ignore_index) & patches.ge(0) & patches.lt(num_classes)
+    safe_labels = patches.masked_fill(~valid, 0).long()
+    counts = torch.zeros(
+        batch_size, num_patches, num_classes, device=labels.device, dtype=torch.long
+    )
+    counts.scatter_add_(2, safe_labels, valid.long())
+    return counts.argmax(dim=-1).masked_fill(~valid.any(dim=-1), ignore_index)
+
+
+def _prototype_logits(tokens: torch.Tensor, prototypes: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Compute cosine-similarity logits between encoder tokens and class prototypes."""
+    if temperature <= 0.0:
+        raise ValueError("prototype_temperature must be positive")
+    return F.normalize(tokens, dim=-1) @ F.normalize(prototypes, dim=-1).transpose(0, 1) / temperature
+
+
+def _prototype_loss(tokens, labels, prototypes, temperature, ignore_index):
+    """Supervise only tokens whose class has a downloaded, valid prototype."""
+    zero = tokens.sum() * 0.0
+    if prototypes is None:
+        return zero
+    active = torch.linalg.vector_norm(prototypes, dim=1) > 1e-6
+    # One prototype has no competing class and therefore no useful CE signal.
+    if int(active.sum().item()) < 2:
+        return zero
+    targets = _token_labels(labels, tokens.shape[1], ignore_index, prototypes.shape[0])
+    valid = targets.ne(ignore_index)
+    valid = valid & active[targets.clamp(0, prototypes.shape[0] - 1)]
+    if not torch.any(valid):
+        return zero
+    logits = _prototype_logits(tokens, prototypes.detach(), temperature)
+    logits = logits.masked_fill(~active, torch.finfo(logits.dtype).min)
+    return F.cross_entropy(logits[valid], targets[valid])
+
+
+@torch.no_grad()
+def _update_prototypes(
+    prototypes: torch.Tensor,
+    fused_tokens: torch.Tensor,
+    labels: torch.Tensor,
+    num_classes: int,
+    ignore_index: int,
+    momentum: float,
+) -> None:
+    """Update server class centers from fused tokens and pixel labels."""
+    if not 0.0 <= momentum < 1.0:
+        raise ValueError("prototype_momentum must be in the interval [0, 1)")
+    token_labels = _token_labels(
+        labels, fused_tokens.shape[1], ignore_index, num_classes
+    ).to(fused_tokens.device)
+    normalized_tokens = F.normalize(fused_tokens, dim=-1)
+    for class_id in range(num_classes):
+        selected = normalized_tokens[token_labels == class_id]
+        if selected.numel() == 0:
+            continue
+        center_mean = selected.mean(dim=0)
+        if torch.linalg.vector_norm(center_mean) < 1e-6:
+            continue
+        class_center = F.normalize(center_mean, dim=0)
+        if torch.linalg.vector_norm(prototypes[class_id]) == 0:
+            prototypes[class_id].copy_(class_center)
+        else:
+            prototypes[class_id].mul_(momentum).add_(class_center, alpha=1.0 - momentum)
+            prototypes[class_id].copy_(F.normalize(prototypes[class_id], dim=0))
+
+
+def _add_prototype_downlink_cost(estimate, prototype_bank, contact, config) -> int:
+    """Count one bank per satellite and its additional downlink time."""
+    if prototype_bank is None:
+        return 0
+    prototype_bytes = int(prototype_bank.numel() * prototype_bank.element_size())
+    rate_bps = float(contact["downlink_mbps"]) * 1e6
+    previous_download_s = float(estimate["download_s"])
+    estimate["radar_download_bytes"] += prototype_bytes
+    estimate["optical_download_bytes"] += prototype_bytes
+    radar_s = estimate["radar_download_bytes"] * 8 / rate_bps
+    optical_s = estimate["optical_download_bytes"] * 8 / rate_bps
+    if config["segmentation_training"]["paired_uplink_mode"] == "parallel_full_rate":
+        estimate["download_s"] = max(radar_s, optical_s)
+    else:
+        estimate["download_s"] = radar_s + optical_s
+    estimate["duration_s"] += estimate["download_s"] - previous_download_s
+    return prototype_bytes
 
 
 def load_json(path: Path):
@@ -108,7 +212,7 @@ def _prune_buffer(buffer: dict[int, FeaturePacket], limit: int) -> None:
 def train_pair_offline_no_projection(
     pair: PlanePair, stop_time_s, config, radar_worker, optical_worker,
     radar_auxiliary, optical_auxiliary, attention_bias, criterion, device,
-    epoch, log_rows,
+    epoch, log_rows, prototype_bank=None,
 ):
     """Satellite-side training with the auxiliary head on raw encoder tokens."""
     training = config["segmentation_training"]
@@ -132,6 +236,10 @@ def train_pair_offline_no_projection(
     step_s = max(float(training["radar_local_compute_s"]), float(training["optical_local_compute_s"]))
     buffer_limit = int(training["recent_smashed_batches"])
     image_size = int(config["croma"]["patch_size"]) * math.isqrt(int(config["croma"]["num_patches"]))
+    prototype_enabled = bool(training.get("prototype_learning_enabled", prototype_bank is not None))
+    prototype_temperature = float(training.get("prototype_temperature", 0.1))
+    prototype_weight = float(training.get("prototype_loss_weight", 0.5))
+    downloaded_prototypes = pair.prototype_bank if pair.prototype_bank is not None else prototype_bank
     completed = 0
     while (
         completed < int(training["local_steps_per_disconnection"])
@@ -146,13 +254,27 @@ def train_pair_offline_no_projection(
         radar_optimizer.zero_grad()
         radar_tokens = radar_worker(radar, attention_bias, mask_info=None)
         radar_loss = criterion(radar_auxiliary(radar_tokens, image_size), labels_device)
-        radar_loss.backward()
+        radar_prototype_loss = (
+            _prototype_loss(
+                radar_tokens, labels_device, downloaded_prototypes,
+                prototype_temperature, criterion.ignore_index,
+            )
+            if prototype_enabled else radar_loss.new_zeros(())
+        )
+        (radar_loss + prototype_weight * radar_prototype_loss).backward()
         radar_optimizer.step()
         pair.radar.local_version += 1
         optical_optimizer.zero_grad()
         optical_tokens = optical_worker(optical, attention_bias, mask_info=None)
         optical_loss = criterion(optical_auxiliary(optical_tokens, image_size), labels_device)
-        optical_loss.backward()
+        optical_prototype_loss = (
+            _prototype_loss(
+                optical_tokens, labels_device, downloaded_prototypes,
+                prototype_temperature, criterion.ignore_index,
+            )
+            if prototype_enabled else optical_loss.new_zeros(())
+        )
+        (optical_loss + prototype_weight * optical_prototype_loss).backward()
         optical_optimizer.step()
         pair.optical.local_version += 1
         pair.radar_buffer[batch_number] = FeaturePacket(
@@ -174,6 +296,8 @@ def train_pair_offline_no_projection(
             "start_utc": utc_at(epoch, step_start), "finish_utc": utc_at(epoch, pair.local_clock_s),
             "radar_auxiliary_loss": round(float(radar_loss.item()), 8),
             "optical_auxiliary_loss": round(float(optical_loss.item()), 8),
+            "radar_prototype_loss": round(float(radar_prototype_loss.item()), 8),
+            "optical_prototype_loss": round(float(optical_prototype_loss.item()), 8),
             "radar_local_version": pair.radar.local_version,
             "optical_local_version": pair.optical.local_version,
             "matched_buffered_batches": len(pair.matched_batch_ids()),
@@ -184,7 +308,8 @@ def train_pair_offline_no_projection(
 
 def train_server_no_projection(
     pair, matched_ids, cross_encoder, ground_head, attention_bias,
-    optimizer, criterion, image_size, device,
+    optimizer, criterion, image_size, device, prototype_bank=None,
+    num_classes=0, prototype_momentum=0.9,
 ):
     """Ground-station update with no projection distillation term."""
     losses = {"segmentation": []}
@@ -199,6 +324,15 @@ def train_server_no_projection(
         segmentation_loss = criterion(ground_head(fused, image_size), radar_packet.labels.to(device))
         segmentation_loss.backward()
         optimizer.step()
+        if prototype_bank is not None and num_classes > 0:
+            _update_prototypes(
+                prototype_bank,
+                fused.detach(),
+                radar_packet.labels.to(device),
+                num_classes,
+                criterion.ignore_index,
+                prototype_momentum,
+            )
         losses["segmentation"].append(float(segmentation_loss.item()))
     return losses
 
@@ -208,6 +342,8 @@ def reset_pair_from_global_no_projection(pair, global_states, global_version):
     pair.radar.auxiliary_state = {key: value.clone() for key, value in global_states["radar_auxiliary"].items()}
     pair.optical.encoder_state = {key: value.clone() for key, value in global_states["optical_encoder"].items()}
     pair.optical.auxiliary_state = {key: value.clone() for key, value in global_states["optical_auxiliary"].items()}
+    if global_states.get("prototype_bank") is not None:
+        pair.prototype_bank = global_states["prototype_bank"].detach().clone()
     pair.radar.downloaded_global_version = global_version
     pair.optical.downloaded_global_version = global_version
 
@@ -245,6 +381,10 @@ def make_plane_pairs(pair_contacts, global_states, config, dataset_bundle):
                 training["batch_size"],
                 training["epochs"],
                 training["seed"] + plane,
+            ),
+            prototype_bank=(
+                global_states["prototype_bank"].detach().clone()
+                if global_states.get("prototype_bank") is not None else None
             ),
         )
     return pairs
@@ -284,6 +424,21 @@ def run_training(config, raw_contacts, output_dir: Path):
     ground_head = PatchSegmentationHead(
         model_config["encoder_dim"], num_classes, model_config["num_patches"]
     ).to(device)
+    prototype_enabled = bool(training.get("prototype_learning_enabled", True))
+    prototype_temperature = float(training.get("prototype_temperature", 0.1))
+    prototype_weight = float(training.get("prototype_loss_weight", 0.5))
+    prototype_momentum = float(training.get("prototype_momentum", 0.9))
+    if prototype_temperature <= 0.0:
+        raise ValueError("prototype_temperature must be positive")
+    if prototype_weight < 0.0:
+        raise ValueError("prototype_loss_weight must be non-negative")
+    if not 0.0 <= prototype_momentum < 1.0:
+        raise ValueError("prototype_momentum must be in the interval [0, 1)")
+    # Prototypes are server state, initialized lazily from the first matched
+    # fused batches and then made available to satellites during disconnection.
+    prototype_bank = torch.zeros(
+        num_classes, int(model_config["encoder_dim"]), device=device
+    ) if prototype_enabled else None
     criterion = nn.CrossEntropyLoss(ignore_index=dataset_bundle.metadata.ignore_index)
     # No projection modules exist, so the station trains only the cross encoder
     # and the ground segmentation head.
@@ -297,6 +452,7 @@ def run_training(config, raw_contacts, output_dir: Path):
         "radar_auxiliary": clone_state(radar_auxiliary),
         "optical_encoder": clone_state(optical_worker),
         "optical_auxiliary": clone_state(optical_auxiliary),
+        "prototype_bank": prototype_bank.detach().clone() if prototype_bank is not None else None,
     }
     pairs = make_plane_pairs(pair_contacts, global_states, config, dataset_bundle)
     test_data = dataset_bundle.validation
@@ -317,6 +473,7 @@ def run_training(config, raw_contacts, output_dir: Path):
         raise ValueError("aggregation_k must be between 1 and the plane count")
     pending, local_log, contact_log, aggregation_log = [], [], [], []
     ground_available_s, global_version, server_updates = 0.0, 0, 0
+    prototype_version = 0
     for contact in pair_contacts:
         pair: PlanePair = pairs[contact["pair_id"]]
         configure_satellite_encoder_trainability(
@@ -325,11 +482,14 @@ def run_training(config, raw_contacts, output_dir: Path):
         train_pair_offline_no_projection(
             pair, contact["start_offset_s"], config, radar_worker, optical_worker,
             radar_auxiliary, optical_auxiliary, attention_bias, criterion, device,
-            epoch, local_log,
+            epoch, local_log, pair.prototype_bank,
         )
         matched_ids = pair.matched_batch_ids()
         will_aggregate = len(pending) + 1 >= aggregation_k
         estimate = estimate_transaction(pair, matched_ids, contact, config, will_aggregate)
+        prototype_downlink_bytes = _add_prototype_downlink_cost(
+            estimate, prototype_bank if prototype_enabled else None, contact, config
+        )
         start_s = max(contact["start_offset_s"], ground_available_s)
         finish_s = start_s + estimate["duration_s"]
         deadline_s = contact["end_offset_s"] - float(config["link"]["safety_margin_s"])
@@ -347,8 +507,12 @@ def run_training(config, raw_contacts, output_dir: Path):
         else:
             losses = train_server_no_projection(
                 pair, matched_ids, cross_encoder, ground_head, attention_bias,
-                server_optimizer, criterion, image_size, device,
+                server_optimizer, criterion, image_size, device, prototype_bank,
+                num_classes, prototype_momentum,
             )
+            global_states["prototype_bank"] = prototype_bank.detach().clone() if prototype_bank is not None else None
+            if prototype_bank is not None:
+                prototype_version += 1
             server_updates += len(losses["segmentation"])
             server_mean_loss = (
                 sum(losses["segmentation"]) / len(losses["segmentation"])
@@ -365,6 +529,7 @@ def run_training(config, raw_contacts, output_dir: Path):
                     "radar_auxiliary": average_states([item.radar_auxiliary_state for item in pending]),
                     "optical_encoder": average_states([item.optical_encoder_state for item in pending]),
                     "optical_auxiliary": average_states([item.optical_auxiliary_state for item in pending]),
+                    "prototype_bank": prototype_bank.detach().clone() if prototype_bank is not None else None,
                 }
                 global_version, aggregation_performed = global_version + 1, True
                 encoder_stage = configure_satellite_encoder_trainability(
@@ -409,6 +574,12 @@ def run_training(config, raw_contacts, output_dir: Path):
             "server_mean_loss": round(server_mean_loss, 8) if server_mean_loss != "" else "",
             "radar_distillation_mean_loss": "",
             "optical_distillation_mean_loss": "",
+            "prototype_downlink_bytes": prototype_downlink_bytes if status == "completed" else 0,
+            "prototype_bank_version": prototype_version if status == "completed" else "",
+            "prototype_active_classes": (
+                int(torch.sum(torch.linalg.vector_norm(prototype_bank, dim=1) > 1e-6).item())
+                if prototype_bank is not None and status == "completed" else ""
+            ),
             "test_accuracy": test_accuracy, "test_miou": test_miou,
             "aggregation_performed": int(aggregation_performed),
             "aggregation_members": aggregation_members,
@@ -421,7 +592,7 @@ def run_training(config, raw_contacts, output_dir: Path):
         train_pair_offline_no_projection(
             pair, horizon_s, config, radar_worker, optical_worker,
             radar_auxiliary, optical_auxiliary, attention_bias, criterion, device,
-            epoch, local_log,
+            epoch, local_log, pair.prototype_bank,
         )
     output_dir.mkdir(parents=True, exist_ok=True)
     write_csv(output_dir / "pair_contact_windows.csv", pair_contacts)
@@ -441,6 +612,21 @@ def run_training(config, raw_contacts, output_dir: Path):
         "algorithm": "paired multimodal CROMA SFL without projection layers and without staleness weighting",
         "projection_layers": "removed; satellite auxiliary heads consume encoder tokens directly",
         "ground_distillation": "disabled (no projR/projO MSE)",
+        "prototype_learning": {
+            "enabled": prototype_enabled,
+            "temperature": prototype_temperature,
+            "loss_weight": prototype_weight,
+            "momentum": prototype_momentum,
+            "updates": prototype_version,
+            "active_classes": int(torch.sum(torch.linalg.vector_norm(prototype_bank, dim=1) > 1e-6).item()) if prototype_bank is not None else 0,
+        },
+        "prototype_learning": {
+            "enabled": prototype_enabled,
+            "temperature": prototype_temperature,
+            "loss_weight": prototype_weight,
+            "momentum": prototype_momentum,
+            "supervision": "encoder-token cosine classification with server fused-feature class centers",
+        },
         "device": str(device),
         "croma_profile": model_config["profile"], "checkpoint": checkpoint_status,
         "image_size": image_size,
@@ -476,6 +662,7 @@ def run_training(config, raw_contacts, output_dir: Path):
         "config": config, "global_version": global_version, "global_states": global_states,
         "cross_encoder_state": clone_state(cross_encoder),
         "ground_segmentation_head_state": clone_state(ground_head),
+        "prototype_bank": prototype_bank.detach().cpu() if prototype_bank is not None else None,
     }, output_dir / "multimodal_final_checkpoint.pt")
     print(json.dumps(summary, indent=2))
     print(f"Pair contacts: {output_dir / 'pair_contact_windows.csv'}")
