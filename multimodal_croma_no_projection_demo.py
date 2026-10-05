@@ -338,14 +338,17 @@ def train_server_no_projection(
 
 
 def reset_pair_from_global_no_projection(pair, global_states, global_version):
-    pair.radar.encoder_state = {key: value.clone() for key, value in global_states["radar_encoder"].items()}
-    pair.radar.auxiliary_state = {key: value.clone() for key, value in global_states["radar_auxiliary"].items()}
-    pair.optical.encoder_state = {key: value.clone() for key, value in global_states["optical_encoder"].items()}
-    pair.optical.auxiliary_state = {key: value.clone() for key, value in global_states["optical_auxiliary"].items()}
-    if global_states.get("prototype_bank") is not None:
-        pair.prototype_bank = global_states["prototype_bank"].detach().clone()
-    pair.radar.downloaded_global_version = global_version
-    pair.optical.downloaded_global_version = global_version
+    """Download encoders/auxiliary heads only when their global version is newer."""
+    for modality in (pair.radar, pair.optical):
+        if global_version > modality.downloaded_global_version:
+            prefix = modality.modality
+            modality.encoder_state = {
+                key: value.clone() for key, value in global_states[f"{prefix}_encoder"].items()
+            }
+            modality.auxiliary_state = {
+                key: value.clone() for key, value in global_states[f"{prefix}_auxiliary"].items()
+            }
+            modality.downloaded_global_version = global_version
 
 
 def make_plane_pairs(pair_contacts, global_states, config, dataset_bundle):
@@ -555,6 +558,7 @@ def run_training(config, raw_contacts, output_dir: Path):
                     flush=True,
                 )
                 pending.clear()
+            # 保留本地训练结果，直到服务器有比该卫星已下载版本更新的全局模型。
             reset_pair_from_global_no_projection(pair, global_states, global_version)
             pair.radar_buffer.clear()
             pair.optical_buffer.clear()
