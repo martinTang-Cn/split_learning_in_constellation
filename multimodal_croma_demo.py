@@ -304,7 +304,8 @@ def run_training(config, raw_contacts, output_dir: Path):
                     flush=True,
                 )
                 pending.clear()
-            # 7) 该对重置到最新全局模型,并清空特征缓冲(避免上传陈旧特征)
+            # 7) 仅在全局版本更新时同步编码器和辅助头；每次成功连接都同步投影层。
+            # 同版本时保留本地训练结果，并清空已经上传的特征缓冲。
             reset_pair_from_global(pair, global_states, global_version)
             pair.radar_buffer.clear()
             pair.optical_buffer.clear()
