@@ -234,11 +234,19 @@ def train_server_on_matched_features(
 
 
 def reset_pair_from_global(pair, global_states, global_version):
-    pair.radar.encoder_state = {key: value.clone() for key, value in global_states["radar_encoder"].items()}
-    pair.radar.auxiliary_state = {key: value.clone() for key, value in global_states["radar_auxiliary"].items()}
-    pair.radar.projection_state = {key: value.clone() for key, value in global_states["radar_projection"].items()}
-    pair.optical.encoder_state = {key: value.clone() for key, value in global_states["optical_encoder"].items()}
-    pair.optical.auxiliary_state = {key: value.clone() for key, value in global_states["optical_auxiliary"].items()}
-    pair.optical.projection_state = {key: value.clone() for key, value in global_states["optical_projection"].items()}
-    pair.radar.downloaded_global_version = global_version
-    pair.optical.downloaded_global_version = global_version
+    """Sync newer global encoders/heads and always download ground projections."""
+    for modality in (pair.radar, pair.optical):
+        prefix = modality.modality
+        # Preserve local progress until the server has a newer global version.
+        if global_version > modality.downloaded_global_version:
+            modality.encoder_state = {
+                key: value.clone() for key, value in global_states[f"{prefix}_encoder"].items()
+            }
+            modality.auxiliary_state = {
+                key: value.clone() for key, value in global_states[f"{prefix}_auxiliary"].items()
+            }
+            modality.downloaded_global_version = global_version
+        # Ground distillation changes projections independently of aggregation.
+        modality.projection_state = {
+            key: value.clone() for key, value in global_states[f"{prefix}_projection"].items()
+        }
