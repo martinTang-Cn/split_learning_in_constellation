@@ -331,7 +331,7 @@ def run_training(config, raw_contacts, output_dir: Path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=Path, default=PROJECT_DIR / "config.json")
+    parser.add_argument("--config", type=Path, default=PROJECT_DIR / "config_houston.json")
     parser.add_argument("--contacts", type=Path, default=PROJECT_DIR / "outputs" / "contact_windows.csv")
     parser.add_argument(
         "--output-dir", type=Path, default=DEFAULT_RUNS_DIR,
