@@ -98,6 +98,27 @@ The EMA setting is controlled by `ema_teacher_enabled`,
 `distillation_weight_start`, `distillation_weight_end`, and
 `distillation_anneal_steps`.
 
+Both SFL variants use `segmentation_training.max_global_version_lag` (default
+`1`) to reject overly old satellite models and cached features. A lag strictly
+greater than this limit makes the contact a download-only transaction: the
+pair receives the latest global encoders and auxiliary heads, and discards its
+old feature buffers. The projection-based variant also downloads the current
+projections. No features or local updates are uploaded, no features are
+recomputed, and no ground training or aggregation contribution occurs in this
+contact. The next disconnected interval resumes normal local training from
+the downloaded model and the next batches in the existing data stream. Set
+the limit to `0` to synchronize whenever the pair is behind by any version.
+
+Only the model download and propagation delay occupy the download-only
+transaction. If it cannot fit in the contact, the transaction is skipped and
+the pair keeps its current model and buffers for a later connection. A stale
+pair can synchronize even when it has no matched feature batches. Successful
+download-only contacts are logged as `status=model_synced`,
+`reason=global_version_lag_exceeded`, with zero upload bytes and server updates.
+Logs also record the incoming version lag, model-sync flags, download bytes,
+and download time. Download-only contacts are counted separately from training
+contacts and skipped contacts in the summary.
+
 ## Demo profile and real data
 
 The checked-in configuration uses a small CROMA profile so the full pipeline

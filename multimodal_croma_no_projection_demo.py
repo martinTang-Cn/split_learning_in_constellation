@@ -50,6 +50,7 @@ from multimodal_sfl import (
     average_states,
     clone_state,
     estimate_transaction,
+    contact_version_lag,
 )
 from orbit_model import parse_utc
 from pair_contact_scheduler import build_pair_contacts, load_raw_contacts, utc_at
@@ -69,6 +70,8 @@ CONTACT_LOG_FIELDS = [
     "radar_distillation_mean_loss", "optical_distillation_mean_loss",
     "test_accuracy", "test_miou", "aggregation_performed",
     "aggregation_members", "global_version", "modeled_transaction_s",
+    "global_version_lag", "model_sync_required", "model_sync_performed",
+    "radar_download_bytes", "optical_download_bytes", "download_s",
 ]
 
 
@@ -159,10 +162,12 @@ def train_pair_offline_no_projection(
         pair.radar_buffer[batch_number] = FeaturePacket(
             radar_tokens.detach().cpu().clone(), labels.clone(), sample_ids.clone(),
             batch_number, pair.radar.local_version,
+            pair.radar.downloaded_global_version,
         )
         pair.optical_buffer[batch_number] = FeaturePacket(
             optical_tokens.detach().cpu().clone(), labels.clone(), sample_ids.clone(),
             batch_number, pair.optical.local_version,
+            pair.optical.downloaded_global_version,
         )
         _prune_buffer(pair.radar_buffer, buffer_limit)
         _prune_buffer(pair.optical_buffer, buffer_limit)
@@ -335,8 +340,11 @@ def run_training(config, raw_contacts, output_dir: Path):
             epoch, local_log,
         )
         matched_ids = pair.matched_batch_ids()
-        will_aggregate = len(pending) + 1 >= aggregation_k
-        estimate = estimate_transaction(pair, matched_ids, contact, config, will_aggregate)
+        version_lag, needs_sync = contact_version_lag(pair, matched_ids, global_version, config)
+        model_sync_performed = False
+        will_aggregate = not needs_sync and len(pending) + 1 >= aggregation_k
+        estimate = estimate_transaction(pair, matched_ids, contact, config, will_aggregate,
+                                        download_only=needs_sync)
         start_s = max(contact["start_offset_s"], ground_available_s)
         finish_s = start_s + estimate["duration_s"]
         deadline_s = contact["end_offset_s"] - float(config["link"]["safety_margin_s"])
@@ -345,12 +353,26 @@ def run_training(config, raw_contacts, output_dir: Path):
         aggregation_members, aggregation_performed = "", False
         test_accuracy, test_miou = "", ""
         server_mean_loss = ""
-        if not matched_ids:
+        if not matched_ids and not needs_sync:
             status, reason = "skipped", "no_matched_multimodal_features"
         elif start_s >= contact["end_offset_s"]:
             status, reason = "skipped", "ground_station_busy_until_disconnect"
         elif finish_s > deadline_s:
-            status, reason = "skipped", "paired_transaction_does_not_fit_contact"
+            status, reason = "skipped", ("model_download_does_not_fit_contact" if needs_sync
+                                          else "paired_transaction_does_not_fit_contact")
+        elif needs_sync:
+            reset_pair_from_global_no_projection(pair, global_states, global_version)
+            pair.radar_buffer.clear()
+            pair.optical_buffer.clear()
+            ground_available_s = finish_s
+            model_sync_performed = True
+            status, reason = "model_synced", "global_version_lag_exceeded"
+            print(
+                f"[stale-model-sync] window_end_utc={contact['end_utc']} "
+                f"pair={pair.pair_id} version_lag={version_lag} "
+                f"downloaded_global_version={global_version} server_updates=0",
+                flush=True,
+            )
         else:
             losses = train_server_no_projection(
                 pair, matched_ids, cross_encoder, ground_head, attention_bias,
@@ -408,8 +430,8 @@ def run_training(config, raw_contacts, output_dir: Path):
             "optical_satellite_id": pair.optical.satellite_id,
             "direct_satellites": contact["direct_satellites"],
             "contact_start_utc": contact["start_utc"], "contact_end_utc": contact["end_utc"],
-            "transaction_start_utc": utc_at(epoch, start_s) if status == "completed" else "",
-            "transaction_finish_utc": utc_at(epoch, finish_s) if status == "completed" else "",
+            "transaction_start_utc": utc_at(epoch, start_s) if status in {"completed", "model_synced"} else "",
+            "transaction_finish_utc": utc_at(epoch, finish_s) if status in {"completed", "model_synced"} else "",
             "status": status, "reason": reason, "matched_batches": len(matched_ids),
             "radar_upload_bytes": estimate["radar_upload_bytes"],
             "optical_upload_bytes": estimate["optical_upload_bytes"],
@@ -422,6 +444,11 @@ def run_training(config, raw_contacts, output_dir: Path):
             "aggregation_members": aggregation_members,
             "global_version": global_version,
             "modeled_transaction_s": round(estimate["duration_s"], 8),
+            "global_version_lag": version_lag, "model_sync_required": int(needs_sync),
+            "model_sync_performed": int(model_sync_performed),
+            "radar_download_bytes": estimate["radar_download_bytes"],
+            "optical_download_bytes": estimate["optical_download_bytes"],
+            "download_s": round(estimate["download_s"], 8),
         })
         pair.local_clock_s = max(pair.local_clock_s, contact["end_offset_s"])
 
@@ -463,9 +490,11 @@ def run_training(config, raw_contacts, output_dir: Path):
         "plane_pairs": len(pairs), "pair_contact_windows": len(pair_contacts),
         "local_paired_steps": len(local_log),
         "server_updates": server_updates, "successful_pair_transactions": successful,
-        "skipped_pair_contacts": len(contact_log) - successful,
+        "skipped_pair_contacts": sum(row["status"] == "skipped" for row in contact_log),
         "aggregations": len(aggregation_log),
         "aggregation_k": aggregation_k, "aggregation": "uniform arithmetic mean per modality",
+        "max_global_version_lag": int(training.get("max_global_version_lag", 1)),
+        "model_sync_only_contacts": sum(row["model_sync_performed"] for row in contact_log),
         "pretrained_encoder_schedule": {
             "mode": str(encoder_schedule["mode"]),
             "warmup_aggregations": int(encoder_schedule["warmup_aggregations"]),
