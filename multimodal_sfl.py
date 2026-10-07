@@ -18,6 +18,7 @@ class FeaturePacket:
     sample_ids: torch.Tensor
     batch_number: int
     local_version: int
+    encoder_global_version: int = 0
 
 
 @dataclass
@@ -153,8 +154,8 @@ def train_pair_offline(
         optical_loss.backward()
         optical_optimizer.step()
         pair.optical.local_version += 1
-        pair.radar_buffer[batch_number] = FeaturePacket(radar_tokens.detach().cpu().clone(), labels.clone(), sample_ids.clone(), batch_number, pair.radar.local_version)
-        pair.optical_buffer[batch_number] = FeaturePacket(optical_tokens.detach().cpu().clone(), labels.clone(), sample_ids.clone(), batch_number, pair.optical.local_version)
+        pair.radar_buffer[batch_number] = FeaturePacket(radar_tokens.detach().cpu().clone(), labels.clone(), sample_ids.clone(), batch_number, pair.radar.local_version, pair.radar.downloaded_global_version)
+        pair.optical_buffer[batch_number] = FeaturePacket(optical_tokens.detach().cpu().clone(), labels.clone(), sample_ids.clone(), batch_number, pair.optical.local_version, pair.optical.downloaded_global_version)
         _prune_buffer(pair.radar_buffer, buffer_limit)
         _prune_buffer(pair.optical_buffer, buffer_limit)
         pair.local_clock_s += step_s
@@ -180,12 +181,33 @@ def _packet_bytes(packet: FeaturePacket, include_labels: bool) -> int:
     return total + tensor_nbytes(packet.labels) if include_labels else total
 
 
-def estimate_transaction(pair, matched_ids, contact, config, will_aggregate):
+def contact_version_lag(pair, matched_ids, global_version, config):
+    """Compare the oldest model/feature base version with the current server."""
+    limit = int(config["segmentation_training"].get("max_global_version_lag", 1))
+    if limit < 0:
+        raise ValueError("segmentation_training.max_global_version_lag must be nonnegative")
+    versions = [pair.radar.downloaded_global_version, pair.optical.downloaded_global_version]
+    for batch_id in matched_ids:
+        versions.extend((pair.radar_buffer[batch_id].encoder_global_version,
+                         pair.optical_buffer[batch_id].encoder_global_version))
+    lag = max(0, global_version - min(versions))
+    return lag, lag > limit
+
+
+def estimate_transaction(pair, matched_ids, contact, config, will_aggregate,
+                         download_only=False):
     """Calculate one paired satellite-ground transaction on parallel links."""
     link, training = config["link"], config["segmentation_training"]
     overhead = int(link["protocol_overhead_bytes"])
-    radar_up = state_nbytes(pair.radar.encoder_state) + state_nbytes(pair.radar.auxiliary_state) + sum(_packet_bytes(pair.radar_buffer[key], True) for key in matched_ids) + overhead
-    optical_up = state_nbytes(pair.optical.encoder_state) + state_nbytes(pair.optical.auxiliary_state) + sum(_packet_bytes(pair.optical_buffer[key], False) for key in matched_ids) + overhead
+    # Stale pairs only download the global model; neither features nor local updates are uploaded.
+    radar_up = 0 if download_only else (
+        state_nbytes(pair.radar.encoder_state) + state_nbytes(pair.radar.auxiliary_state)
+        + sum(_packet_bytes(pair.radar_buffer[key], True) for key in matched_ids) + overhead
+    )
+    optical_up = 0 if download_only else (
+        state_nbytes(pair.optical.encoder_state) + state_nbytes(pair.optical.auxiliary_state)
+        + sum(_packet_bytes(pair.optical_buffer[key], False) for key in matched_ids) + overhead
+    )
     radar_down = state_nbytes(pair.radar.encoder_state) + state_nbytes(pair.radar.auxiliary_state) + state_nbytes(pair.radar.projection_state) + overhead
     optical_down = state_nbytes(pair.optical.encoder_state) + state_nbytes(pair.optical.auxiliary_state) + state_nbytes(pair.optical.projection_state) + overhead
     radar_upload_s, optical_upload_s = radar_up * 8 / (contact["uplink_mbps"] * 1e6), optical_up * 8 / (contact["uplink_mbps"] * 1e6)
@@ -195,8 +217,8 @@ def estimate_transaction(pair, matched_ids, contact, config, will_aggregate):
     else:
         upload_s, download_s = radar_upload_s + optical_upload_s, radar_download_s + optical_download_s
     propagation_s = 2 * contact["min_slant_range_km"] / SPEED_OF_LIGHT_KM_S
-    server_s = len(matched_ids) * float(training["server_compute_s_per_batch"])
-    aggregation_s = float(training["aggregation_compute_s"]) if will_aggregate else 0.0
+    server_s = 0.0 if download_only else len(matched_ids) * float(training["server_compute_s_per_batch"])
+    aggregation_s = float(training["aggregation_compute_s"]) if will_aggregate and not download_only else 0.0
     return {
         "radar_upload_bytes": radar_up, "optical_upload_bytes": optical_up,
         "radar_download_bytes": radar_down, "optical_download_bytes": optical_down,
@@ -234,11 +256,19 @@ def train_server_on_matched_features(
 
 
 def reset_pair_from_global(pair, global_states, global_version):
-    pair.radar.encoder_state = {key: value.clone() for key, value in global_states["radar_encoder"].items()}
-    pair.radar.auxiliary_state = {key: value.clone() for key, value in global_states["radar_auxiliary"].items()}
-    pair.radar.projection_state = {key: value.clone() for key, value in global_states["radar_projection"].items()}
-    pair.optical.encoder_state = {key: value.clone() for key, value in global_states["optical_encoder"].items()}
-    pair.optical.auxiliary_state = {key: value.clone() for key, value in global_states["optical_auxiliary"].items()}
-    pair.optical.projection_state = {key: value.clone() for key, value in global_states["optical_projection"].items()}
-    pair.radar.downloaded_global_version = global_version
-    pair.optical.downloaded_global_version = global_version
+    """Sync newer global encoders/heads and always download ground projections."""
+    for modality in (pair.radar, pair.optical):
+        prefix = modality.modality
+        # Preserve local progress until the server has a newer global version.
+        if global_version > modality.downloaded_global_version:
+            modality.encoder_state = {
+                key: value.clone() for key, value in global_states[f"{prefix}_encoder"].items()
+            }
+            modality.auxiliary_state = {
+                key: value.clone() for key, value in global_states[f"{prefix}_auxiliary"].items()
+            }
+            modality.downloaded_global_version = global_version
+        # Ground distillation changes projections independently of aggregation.
+        modality.projection_state = {
+            key: value.clone() for key, value in global_states[f"{prefix}_projection"].items()
+        }
