@@ -28,7 +28,7 @@ from multimodal_evaluation import evaluate_global, write_csv
 from multimodal_sfl import (
     ModalityState, PairContribution, PlanePair, average_states, clone_state,
     estimate_transaction, reset_pair_from_global, train_pair_offline,
-    train_server_on_matched_features, contact_version_lag,
+    train_server_on_matched_features,
 )
 from orbit_model import parse_utc
 from pair_contact_scheduler import build_pair_contacts, load_raw_contacts, utc_at
@@ -185,13 +185,10 @@ def run_training(config, raw_contacts, output_dir: Path):
         train_pair_offline(pair, contact["start_offset_s"], config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
         # 2) 找到双模态缓冲区中可对齐融合的批次(batch_number 交集)
         matched_ids = pair.matched_batch_ids()
-        version_lag, needs_sync = contact_version_lag(pair, matched_ids, global_version, config)
-        model_sync_performed = False
         # 本次事务是否会触发聚合(聚合耗时需计入事务时长估算)
-        will_aggregate = not needs_sync and len(pending) + 1 >= aggregation_k
+        will_aggregate = len(pending) + 1 >= aggregation_k
         # 估算本次过站事务的传输字节数与总耗时(上行 + 传播 + 服务器计算 + 聚合 + 下行)
-        estimate = estimate_transaction(pair, matched_ids, contact, config, will_aggregate,
-                                        download_only=needs_sync)
+        estimate = estimate_transaction(pair, matched_ids, contact, config, will_aggregate)
         # 3) 排期:最早只能在窗口开始且地面站空闲后开始;截止时间预留安全余量
         start_s = max(contact["start_offset_s"], ground_available_s)
         finish_s = start_s + estimate["duration_s"]
@@ -202,27 +199,12 @@ def run_training(config, raw_contacts, output_dir: Path):
         test_accuracy, test_miou = "", ""
         server_mean_loss = ""
         # 4) 三种跳过情形:无匹配特征 / 地面站忙到窗口断开 / 事务放不进窗口
-        if not matched_ids and not needs_sync:
+        if not matched_ids:
             status, reason = "skipped", "no_matched_multimodal_features"
         elif start_s >= contact["end_offset_s"]:
             status, reason = "skipped", "ground_station_busy_until_disconnect"
         elif finish_s > deadline_s:
-            status, reason = "skipped", ("model_download_does_not_fit_contact" if needs_sync
-                                          else "paired_transaction_does_not_fit_contact")
-        elif needs_sync:
-            # 陈旧窗口只下载全局模型，丢弃旧特征，下一断连阶段再正常训练。
-            reset_pair_from_global(pair, global_states, global_version)
-            pair.radar_buffer.clear()
-            pair.optical_buffer.clear()
-            ground_available_s = finish_s
-            model_sync_performed = True
-            status, reason = "model_synced", "global_version_lag_exceeded"
-            print(
-                f"[stale-model-sync] window_end_utc={contact['end_utc']} "
-                f"pair={pair.pair_id} version_lag={version_lag} "
-                f"downloaded_global_version={global_version} server_updates=0",
-                flush=True,
-            )
+            status, reason = "skipped", "paired_transaction_does_not_fit_contact"
         else:
             # 5) 地面端:跨模态编码器 + 地面头在匹配特征上做监督训练
             losses = train_server_on_matched_features(pair, matched_ids, cross_encoder, ground_head, radar_projection, optical_projection, attention_bias, server_optimizer, criterion, image_size, device)
@@ -271,8 +253,7 @@ def run_training(config, raw_contacts, output_dir: Path):
                     flush=True,
                 )
                 pending.clear()
-            # 7) 仅在全局版本更新时同步编码器和辅助头；每次成功连接都同步投影层。
-            # 同版本时保留本地训练结果，并清空已经上传的特征缓冲。
+            # 7) 该对重置到最新全局模型,并清空特征缓冲(避免上传陈旧特征)
             reset_pair_from_global(pair, global_states, global_version)
             pair.radar_buffer.clear()
             pair.optical_buffer.clear()
@@ -283,8 +264,8 @@ def run_training(config, raw_contacts, output_dir: Path):
             "pair_contact_id": contact["pair_contact_id"], "pair_id": pair.pair_id,
             "radar_satellite_id": pair.radar.satellite_id, "optical_satellite_id": pair.optical.satellite_id,
             "direct_satellites": contact["direct_satellites"], "contact_start_utc": contact["start_utc"], "contact_end_utc": contact["end_utc"],
-            "transaction_start_utc": utc_at(epoch, start_s) if status in {"completed", "model_synced"} else "",
-            "transaction_finish_utc": utc_at(epoch, finish_s) if status in {"completed", "model_synced"} else "",
+            "transaction_start_utc": utc_at(epoch, start_s) if status == "completed" else "",
+            "transaction_finish_utc": utc_at(epoch, finish_s) if status == "completed" else "",
             "status": status, "reason": reason, "matched_batches": len(matched_ids),
             "radar_upload_bytes": estimate["radar_upload_bytes"], "optical_upload_bytes": estimate["optical_upload_bytes"],
             "server_updates": len(losses["segmentation"]),
@@ -294,11 +275,6 @@ def run_training(config, raw_contacts, output_dir: Path):
             "test_accuracy": test_accuracy, "test_miou": test_miou,
             "aggregation_performed": int(aggregation_performed), "aggregation_members": aggregation_members,
             "global_version": global_version, "modeled_transaction_s": round(estimate["duration_s"], 8),
-            "global_version_lag": version_lag, "model_sync_required": int(needs_sync),
-            "model_sync_performed": int(model_sync_performed),
-            "radar_download_bytes": estimate["radar_download_bytes"],
-            "optical_download_bytes": estimate["optical_download_bytes"],
-            "download_s": round(estimate["download_s"], 8),
         })
         # 星上本地训练只允许发生在不可见时段:把该对时钟直接推进到窗口结束
         pair.local_clock_s = max(pair.local_clock_s, contact["end_offset_s"])
@@ -330,10 +306,8 @@ def run_training(config, raw_contacts, output_dir: Path):
         },
         "plane_pairs": len(pairs), "pair_contact_windows": len(pair_contacts), "local_paired_steps": len(local_log),
         "server_updates": server_updates, "successful_pair_transactions": successful,
-        "skipped_pair_contacts": sum(row["status"] == "skipped" for row in contact_log), "aggregations": len(aggregation_log),
+        "skipped_pair_contacts": len(contact_log) - successful, "aggregations": len(aggregation_log),
         "aggregation_k": aggregation_k, "aggregation": "uniform arithmetic mean per modality",
-        "max_global_version_lag": int(training.get("max_global_version_lag", 1)),
-        "model_sync_only_contacts": sum(row["model_sync_performed"] for row in contact_log),
         "pretrained_encoder_schedule": {
             "mode": str(encoder_schedule["mode"]),
             "warmup_aggregations": int(encoder_schedule["warmup_aggregations"]),
