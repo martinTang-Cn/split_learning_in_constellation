@@ -101,9 +101,9 @@ def make_plane_pairs(pair_contacts, global_states, config, dataset_bundle):
 def run_training(config, raw_contacts, output_dir: Path):
     """运行配对多模态 CROMA 拆分联邦学习(SFL)仿真的主流程。
 
-    以地面可见窗口为时间轴:每个窗口内先让卫星对完成不可见时段的星上本地
-    训练,过站时上传匹配特征供地面端融合训练;每攒满 aggregation_k 次贡献
-    做一次全局聚合。结束后评估、写日志并保存 checkpoint。
+    每个窗口依次执行:复制卫星模型作为贡献并覆盖为当前全局模型、按 k 聚合、
+    用上一轮缓存训练地面端、串行模拟下一段断连期的卫星本地训练。
+    卫星在聚合前下载全局模型,本轮新聚合模型留待后续窗口下载。
     """
     run_started_at = time.perf_counter()
     training, model_config = config["segmentation_training"], config["croma"]
@@ -174,6 +174,14 @@ def run_training(config, raw_contacts, output_dir: Path):
     # ground_available_s:地面站最早可用时刻(串行独占资源)
     # global_version:全局模型版本号;server_updates:服务器累计训练步数
     ground_available_s, global_version, server_updates = 0.0, 0, 0
+    # 每次窗口后预先模拟该对到下次连接前的断连训练,缓存留给下次窗口。
+    next_contact_start = {}
+    next_start_by_pair = {}
+    for contact in reversed(pair_contacts):
+        next_contact_start[contact["pair_contact_id"]] = next_start_by_pair.get(
+            contact["pair_id"], horizon_s
+        )
+        next_start_by_pair[contact["pair_id"]] = contact["start_offset_s"]
     # 离散事件主循环:按时间顺序处理每个配对可见窗口
     for contact in pair_contacts:
         pair: PlanePair = pairs[contact["pair_id"]]
@@ -181,9 +189,7 @@ def run_training(config, raw_contacts, output_dir: Path):
         configure_satellite_encoder_trainability(
             radar_worker, optical_worker, config, global_version
         )
-        # 1) 窗口开始前:卫星对在不可见时段做星上本地训练,产出带版本号的特征包
-        train_pair_offline(pair, contact["start_offset_s"], config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
-        # 2) 找到双模态缓冲区中可对齐融合的批次(batch_number 交集)
+        # 只读取上一轮缓存;本轮本地训练在地面训练之后执行。
         matched_ids = pair.matched_batch_ids()
         # 本次事务是否会触发聚合(聚合耗时需计入事务时长估算)
         will_aggregate = len(pending) + 1 >= aggregation_k
@@ -198,25 +204,22 @@ def run_training(config, raw_contacts, output_dir: Path):
         aggregation_members, aggregation_performed = "", False
         test_accuracy, test_miou = "", ""
         server_mean_loss = ""
-        # 4) 三种跳过情形:无匹配特征 / 地面站忙到窗口断开 / 事务放不进窗口
-        if not matched_ids:
-            status, reason = "skipped", "no_matched_multimodal_features"
-        elif start_s >= contact["end_offset_s"]:
+        # 无特征时仍允许交换模型,以启动第一轮本地训练。
+        if start_s >= contact["end_offset_s"]:
             status, reason = "skipped", "ground_station_busy_until_disconnect"
         elif finish_s > deadline_s:
             status, reason = "skipped", "paired_transaction_does_not_fit_contact"
         else:
-            # 5) 地面端:跨模态编码器 + 地面头在匹配特征上做监督训练
-            losses = train_server_on_matched_features(pair, matched_ids, cross_encoder, ground_head, radar_projection, optical_projection, attention_bias, server_optimizer, criterion, image_size, device)
-            server_updates += len(losses["segmentation"])
-            server_mean_loss = (
-                sum(losses["segmentation"]) / len(losses["segmentation"])
-                if losses["segmentation"] else ""
-            )
-            global_states["radar_projection"] = clone_state(radar_projection)
-            global_states["optical_projection"] = clone_state(optical_projection)
-            # 该对上传的四份状态(雷达/光学编码器 + 辅助头)作为一次待聚合贡献
-            pending.append(PairContribution(pair.pair_id, pair.radar.encoder_state, pair.radar.auxiliary_state, pair.optical.encoder_state, pair.optical.auxiliary_state))
+            # 1) 深复制贡献,然后下载聚合前的全局模型;缓存特征不随模型覆盖。
+            pending.append(PairContribution(
+                pair.pair_id,
+                {key: value.clone() for key, value in pair.radar.encoder_state.items()},
+                {key: value.clone() for key, value in pair.radar.auxiliary_state.items()},
+                {key: value.clone() for key, value in pair.optical.encoder_state.items()},
+                {key: value.clone() for key, value in pair.optical.auxiliary_state.items()},
+            ))
+            reset_pair_from_global(pair, global_states, global_version)
+            # 2) 达到 aggregation_k 时均匀聚合;不再次覆盖本轮卫星模型。
             if len(pending) == aggregation_k:
                 # 6) 凑满 k 个贡献:按模态做均匀算术平均(FedAvg),产生新的全局版本
                 aggregation_members = ";".join(item.pair_id for item in pending)
@@ -233,6 +236,17 @@ def run_training(config, raw_contacts, output_dir: Path):
                     radar_worker, optical_worker, config, global_version
                 )
                 aggregation_log.append({"global_version": global_version, "finish_utc": utc_at(epoch, finish_s), "plane_pairs": aggregation_members, "pair_count": aggregation_k, "weight_per_pair": round(1.0 / aggregation_k, 8)})
+                pending.clear()
+            # 3) 地面端训练上一轮缓存,更新服务器投影层。
+            losses = train_server_on_matched_features(pair, matched_ids, cross_encoder, ground_head, radar_projection, optical_projection, attention_bias, server_optimizer, criterion, image_size, device)
+            server_updates += len(losses["segmentation"])
+            server_mean_loss = (
+                sum(losses["segmentation"]) / len(losses["segmentation"])
+                if losses["segmentation"] else ""
+            )
+            global_states["radar_projection"] = clone_state(radar_projection)
+            global_states["optical_projection"] = clone_state(optical_projection)
+            if aggregation_performed:
                 # Evaluate the newly aggregated global model once per aggregation.
                 test_accuracy, test_miou, _ = evaluate_global(
                     test_data, radar_worker, optical_worker, cross_encoder,
@@ -252,9 +266,13 @@ def run_training(config, raw_contacts, output_dir: Path):
                     f"test_accuracy={test_accuracy:.8f} test_miou={test_miou:.8f}",
                     flush=True,
                 )
-                pending.clear()
-            # 7) 该对重置到最新全局模型,并清空特征缓冲(避免上传陈旧特征)
-            reset_pair_from_global(pair, global_states, global_version)
+            # 下发本次蒸馏后的投影层,保留步骤 1 下载的 encoder/辅助头。
+            pair.radar.projection_state = {
+                key: value.clone() for key, value in global_states["radar_projection"].items()
+            }
+            pair.optical.projection_state = {
+                key: value.clone() for key, value in global_states["optical_projection"].items()
+            }
             pair.radar_buffer.clear()
             pair.optical_buffer.clear()
             # 地面站被本次事务占用,直到事务结束才空闲
@@ -278,10 +296,16 @@ def run_training(config, raw_contacts, output_dir: Path):
         })
         # 星上本地训练只允许发生在不可见时段:把该对时钟直接推进到窗口结束
         pair.local_clock_s = max(pair.local_clock_s, contact["end_offset_s"])
-
-    # 主循环结束后:各对在剩余时间内完成剩余的本地训练(不再有新事务与聚合)
-    for pair in pairs.values():
-        train_pair_offline(pair, horizon_s, config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
+        # 4) 单卡串行执行断连训练,虚拟时钟仅使用本对窗口后的不可见区间。
+        train_pair_offline(
+            pair, next_contact_start[contact["pair_contact_id"]], config,
+            radar_worker, optical_worker, radar_auxiliary, optical_auxiliary,
+            radar_projection, optical_projection, attention_bias, criterion,
+            device, epoch, local_log,
+        )
+        # 单卡复用投影模块:本地训练会换入星上副本,必须恢复服务器参数。
+        radar_projection.load_state_dict(global_states["radar_projection"])
+        optical_projection.load_state_dict(global_states["optical_projection"])
     output_dir.mkdir(parents=True, exist_ok=True)
     # 输出全部日志:配对窗口 / 本地训练 / 过站事务 / 聚合事件
     write_csv(output_dir / "pair_contact_windows.csv", pair_contacts)

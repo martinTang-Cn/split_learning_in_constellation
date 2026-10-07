@@ -251,7 +251,7 @@ def make_plane_pairs(pair_contacts, global_states, config, dataset_bundle):
 
 
 def run_training(config, raw_contacts, output_dir: Path):
-    """No-projection ablation of the paired multimodal CROMA SFL pipeline."""
+    """Snapshot/reset satellites, aggregate, train cached features, then locally train."""
     run_started_at = time.perf_counter()
     training, model_config = config["segmentation_training"], config["croma"]
     torch.manual_seed(training["seed"])
@@ -317,16 +317,20 @@ def run_training(config, raw_contacts, output_dir: Path):
         raise ValueError("aggregation_k must be between 1 and the plane count")
     pending, local_log, contact_log, aggregation_log = [], [], [], []
     ground_available_s, global_version, server_updates = 0.0, 0, 0
+    # The final step of each window prepares features for this pair's next contact.
+    next_contact_start = {}
+    next_start_by_pair = {}
+    for contact in reversed(pair_contacts):
+        next_contact_start[contact["pair_contact_id"]] = next_start_by_pair.get(
+            contact["pair_id"], horizon_s
+        )
+        next_start_by_pair[contact["pair_id"]] = contact["start_offset_s"]
     for contact in pair_contacts:
         pair: PlanePair = pairs[contact["pair_id"]]
         configure_satellite_encoder_trainability(
             radar_worker, optical_worker, config, global_version
         )
-        train_pair_offline_no_projection(
-            pair, contact["start_offset_s"], config, radar_worker, optical_worker,
-            radar_auxiliary, optical_auxiliary, attention_bias, criterion, device,
-            epoch, local_log,
-        )
+        # Read only the previous round's cached features before local training.
         matched_ids = pair.matched_batch_ids()
         will_aggregate = len(pending) + 1 >= aggregation_k
         estimate = estimate_transaction(pair, matched_ids, contact, config, will_aggregate)
@@ -338,26 +342,22 @@ def run_training(config, raw_contacts, output_dir: Path):
         aggregation_members, aggregation_performed = "", False
         test_accuracy, test_miou = "", ""
         server_mean_loss = ""
-        if not matched_ids:
-            status, reason = "skipped", "no_matched_multimodal_features"
-        elif start_s >= contact["end_offset_s"]:
+        # A feature-free first contact still exchanges models to start the pipeline.
+        if start_s >= contact["end_offset_s"]:
             status, reason = "skipped", "ground_station_busy_until_disconnect"
         elif finish_s > deadline_s:
             status, reason = "skipped", "paired_transaction_does_not_fit_contact"
         else:
-            losses = train_server_no_projection(
-                pair, matched_ids, cross_encoder, ground_head, attention_bias,
-                server_optimizer, criterion, image_size, device,
-            )
-            server_updates += len(losses["segmentation"])
-            server_mean_loss = (
-                sum(losses["segmentation"]) / len(losses["segmentation"])
-                if losses["segmentation"] else ""
-            )
+            # 1) Keep an independent contribution, then download the pre-aggregation model.
             pending.append(PairContribution(
-                pair.pair_id, pair.radar.encoder_state, pair.radar.auxiliary_state,
-                pair.optical.encoder_state, pair.optical.auxiliary_state,
+                pair.pair_id,
+                {key: value.clone() for key, value in pair.radar.encoder_state.items()},
+                {key: value.clone() for key, value in pair.radar.auxiliary_state.items()},
+                {key: value.clone() for key, value in pair.optical.encoder_state.items()},
+                {key: value.clone() for key, value in pair.optical.auxiliary_state.items()},
             ))
+            reset_pair_from_global_no_projection(pair, global_states, global_version)
+            # 2) Aggregate uniformly when k contributions are available.
             if len(pending) == aggregation_k:
                 aggregation_members = ";".join(item.pair_id for item in pending)
                 global_states = {
@@ -375,6 +375,18 @@ def run_training(config, raw_contacts, output_dir: Path):
                     "plane_pairs": aggregation_members, "pair_count": aggregation_k,
                     "weight_per_pair": round(1.0 / aggregation_k, 8),
                 })
+                pending.clear()
+            # 3) Train the server on cached features without changing the downloaded model.
+            losses = train_server_no_projection(
+                pair, matched_ids, cross_encoder, ground_head, attention_bias,
+                server_optimizer, criterion, image_size, device,
+            )
+            server_updates += len(losses["segmentation"])
+            server_mean_loss = (
+                sum(losses["segmentation"]) / len(losses["segmentation"])
+                if losses["segmentation"] else ""
+            )
+            if aggregation_performed:
                 test_accuracy, test_miou, _ = evaluate_global(
                     test_data, radar_worker, optical_worker, cross_encoder,
                     ground_head, attention_bias, global_states, config, device,
@@ -389,8 +401,6 @@ def run_training(config, raw_contacts, output_dir: Path):
                     f"test_accuracy={test_accuracy:.8f} test_miou={test_miou:.8f}",
                     flush=True,
                 )
-                pending.clear()
-            reset_pair_from_global_no_projection(pair, global_states, global_version)
             pair.radar_buffer.clear()
             pair.optical_buffer.clear()
             ground_available_s = finish_s
@@ -416,10 +426,10 @@ def run_training(config, raw_contacts, output_dir: Path):
             "modeled_transaction_s": round(estimate["duration_s"], 8),
         })
         pair.local_clock_s = max(pair.local_clock_s, contact["end_offset_s"])
-
-    for pair in pairs.values():
+        # 4) Serial single-device execution, using only the next disconnected interval.
         train_pair_offline_no_projection(
-            pair, horizon_s, config, radar_worker, optical_worker,
+            pair, next_contact_start[contact["pair_contact_id"]], config,
+            radar_worker, optical_worker,
             radar_auxiliary, optical_auxiliary, attention_bias, criterion, device,
             epoch, local_log,
         )
