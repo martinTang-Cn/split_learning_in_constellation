@@ -323,7 +323,7 @@ def run_training(config, raw_contacts, output_dir: Path):
             flush=True,
         )
     aggregation_k = int(training["aggregation_k"])
-    if not 1 <= aggregation_k <= len(pairs):
+    if not 1 <= aggregation_k:
         raise ValueError("aggregation_k must be between 1 and the plane count")
     pending, local_log, contact_log, aggregation_log = [], [], [], []
     ground_available_s, global_version, server_updates = 0.0, 0, 0
