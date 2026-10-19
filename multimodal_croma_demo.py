@@ -167,8 +167,8 @@ def run_training(config, raw_contacts, output_dir: Path):
         )
     # 每攒满 k 个卫星对的贡献做一次全局聚合
     aggregation_k = int(training["aggregation_k"])
-    if not 1 <= aggregation_k <= len(pairs):
-        raise ValueError("aggregation_k must be between 1 and the plane count")
+    if not 1 <= aggregation_k:
+        raise ValueError("aggregation_k must be larger than 1")
     # pending:待聚合的贡献缓冲;三个日志分别记录本地训练 / 过站事务 / 聚合事件
     pending, local_log, contact_log, aggregation_log = [], [], [], []
     # ground_available_s:地面站最早可用时刻(串行独占资源)
