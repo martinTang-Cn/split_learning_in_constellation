@@ -25,6 +25,7 @@ from multimodal_data import (
     partition_dataset_indices,
 )
 from multimodal_evaluation import evaluate_global, write_csv
+from fusion_diagnostics import FixedGroundFusionProbe
 from multimodal_sfl import (
     ModalityState, PairContribution, PlanePair, average_states, clone_state,
     estimate_transaction, reset_pair_from_global, train_pair_offline,
@@ -151,6 +152,10 @@ def run_training(config, raw_contacts, output_dir: Path):
     }
     # 每个轨道面构建一个卫星对:本地状态副本 + 确定性批次流
     pairs = make_plane_pairs(pair_contacts, global_states, config, dataset_bundle)
+    fusion_probe = FixedGroundFusionProbe(
+        pairs, radar_worker, optical_worker, cross_encoder, ground_head,
+        attention_bias, criterion, image_size, device, training["batch_size"], training["seed"],
+    )
     test_data = dataset_bundle.validation
     encoder_schedule = pretrained_encoder_schedule(config)
     encoder_stage = configure_satellite_encoder_trainability(
@@ -182,7 +187,9 @@ def run_training(config, raw_contacts, output_dir: Path):
             radar_worker, optical_worker, config, global_version
         )
         # 1) 窗口开始前:卫星对在不可见时段做星上本地训练,产出带版本号的特征包
-        train_pair_offline(pair, contact["start_offset_s"], config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
+        # 两次诊断共用同一批原始样本和固定地面模型；不包含地面更新或全局同步。
+        with fusion_probe.measure(pair, contact["pair_contact_id"], global_version, server_updates) as fusion_metrics:
+            train_pair_offline(pair, contact["start_offset_s"], config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
         # 2) 找到双模态缓冲区中可对齐融合的批次(batch_number 交集)
         matched_ids = pair.matched_batch_ids()
         version_lag, needs_sync = contact_version_lag(pair, matched_ids, global_version, config)
@@ -299,6 +306,7 @@ def run_training(config, raw_contacts, output_dir: Path):
             "radar_download_bytes": estimate["radar_download_bytes"],
             "optical_download_bytes": estimate["optical_download_bytes"],
             "download_s": round(estimate["download_s"], 8),
+            **fusion_metrics,
         })
         # 星上本地训练只允许发生在不可见时段:把该对时钟直接推进到窗口结束
         pair.local_clock_s = max(pair.local_clock_s, contact["end_offset_s"])
