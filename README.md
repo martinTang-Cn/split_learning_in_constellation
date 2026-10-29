@@ -101,36 +101,6 @@ contacts and skipped contacts in the summary.
 
 ## Demo profile and real data
 
-### Fixed-ground fusion-loss diagnostic
-
-Both SFL variants run a diagnostic around the offline training associated with
-every pair contact, including skipped and download-only contacts. They sample
-`batch_size` paired examples from that pair's training partition, use the same
-sample tensors before/after offline training, and keep the ground cross encoder
-and segmentation head fixed at the versions present before that contact. The
-probe bypasses projections and auxiliary heads: radar/optical encoders feed
-the cross encoder and ground segmentation head directly. No backward pass or
-ground optimization occurs in the diagnostic.
-
-`multimodal_training_log.csv` contains `fusion_probe_loss_before`,
-`fusion_probe_loss_after`, and `fusion_probe_loss_delta` (after minus before;
-negative means offline updates helped this fixed ground model on this batch).
-It also records sample IDs/count, replacement sampling, labeled pixel count,
-actual paired local steps, and the ground model's global version and cumulative
-server-update count. The diagnostic ground version can differ from the final
-`global_version` in the row if that contact subsequently aggregates. A batch
-with no valid labels is recorded as `fusion_probe_status=no_valid_labels` and
-its losses remain blank. A partition smaller than `batch_size` is sampled with
-replacement; otherwise sampling is without replacement. The main training
-cursor is not consumed or rewound.
-
-Diagnostic sampling is deterministic per seed/pair/contact and isolated from
-training RNG states, so freeze/unfreeze experiments use the same sample IDs.
-All four modules run in evaluation mode for the probe; worker weights/buffers
-and mode flags are restored afterward. Extra diagnostic runtime is real but
-is not added to simulated communication or compute time. These samples come
-from training partitions and are not a held-out generalization estimate.
-
 The checked-in configuration uses a small CROMA profile so the full pipeline
 can be validated on one GPU or CPU:
 

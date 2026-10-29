@@ -42,7 +42,6 @@ from multimodal_data import (
     partition_dataset_indices,
 )
 from multimodal_evaluation import evaluate_global, write_csv
-from fusion_diagnostics import FUSION_PROBE_FIELDS, FixedGroundFusionProbe
 from multimodal_sfl import (
     FeaturePacket,
     ModalityState,
@@ -73,7 +72,6 @@ CONTACT_LOG_FIELDS = [
     "aggregation_members", "global_version", "modeled_transaction_s",
     "global_version_lag", "model_sync_required", "model_sync_performed",
     "radar_download_bytes", "optical_download_bytes", "download_s",
-    *FUSION_PROBE_FIELDS,
 ]
 
 
@@ -311,10 +309,6 @@ def run_training(config, raw_contacts, output_dir: Path):
         "optical_auxiliary": clone_state(optical_auxiliary),
     }
     pairs = make_plane_pairs(pair_contacts, global_states, config, dataset_bundle)
-    fusion_probe = FixedGroundFusionProbe(
-        pairs, radar_worker, optical_worker, cross_encoder, ground_head,
-        attention_bias, criterion, image_size, device, training["batch_size"], training["seed"],
-    )
     test_data = dataset_bundle.validation
     encoder_schedule = pretrained_encoder_schedule(config)
     encoder_stage = configure_satellite_encoder_trainability(
@@ -338,12 +332,11 @@ def run_training(config, raw_contacts, output_dir: Path):
         configure_satellite_encoder_trainability(
             radar_worker, optical_worker, config, global_version
         )
-        with fusion_probe.measure(pair, contact["pair_contact_id"], global_version, server_updates) as fusion_metrics:
-            train_pair_offline_no_projection(
-                pair, contact["start_offset_s"], config, radar_worker, optical_worker,
-                radar_auxiliary, optical_auxiliary, attention_bias, criterion, device,
-                epoch, local_log,
-            )
+        train_pair_offline_no_projection(
+            pair, contact["start_offset_s"], config, radar_worker, optical_worker,
+            radar_auxiliary, optical_auxiliary, attention_bias, criterion, device,
+            epoch, local_log,
+        )
         matched_ids = pair.matched_batch_ids()
         version_lag, needs_sync = contact_version_lag(pair, matched_ids, global_version, config)
         model_sync_performed = False
@@ -454,7 +447,6 @@ def run_training(config, raw_contacts, output_dir: Path):
             "radar_download_bytes": estimate["radar_download_bytes"],
             "optical_download_bytes": estimate["optical_download_bytes"],
             "download_s": round(estimate["download_s"], 8),
-            **fusion_metrics,
         })
         pair.local_clock_s = max(pair.local_clock_s, contact["end_offset_s"])
 
