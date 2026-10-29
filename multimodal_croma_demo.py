@@ -32,6 +32,7 @@ from multimodal_sfl import (
 )
 from orbit_model import parse_utc
 from pair_contact_scheduler import build_pair_contacts, load_raw_contacts, utc_at
+from projection_diagnostics import ProjectionDiagnostics
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -151,6 +152,10 @@ def run_training(config, raw_contacts, output_dir: Path):
     }
     # 每个轨道面构建一个卫星对:本地状态副本 + 确定性批次流
     pairs = make_plane_pairs(pair_contacts, global_states, config, dataset_bundle)
+    projection_diagnostics = ProjectionDiagnostics(
+        pairs, training["batch_size"], training["seed"],
+        output_dir / "multimodal_projection_diagnostics.csv",
+    )
     test_data = dataset_bundle.validation
     encoder_schedule = pretrained_encoder_schedule(config)
     encoder_stage = configure_satellite_encoder_trainability(
@@ -182,7 +187,19 @@ def run_training(config, raw_contacts, output_dir: Path):
             radar_worker, optical_worker, config, global_version
         )
         # 1) 窗口开始前:卫星对在不可见时段做星上本地训练,产出带版本号的特征包
+        # 同一随机配对样本、同一地面 cross encoder，对比本次断连训练前后。
+        diagnostic_batch = projection_diagnostics.sample(pair, device)
+        diagnostic_modules = (radar_worker, optical_worker, cross_encoder,
+                              radar_projection, optical_projection, attention_bias, device)
+        diagnostic_before = projection_diagnostics.measure(pair, diagnostic_batch, *diagnostic_modules)
+        diagnostic_start_s = pair.local_clock_s
+        diagnostic_global_version = global_version
+        diagnostic_radar_version = pair.radar.downloaded_global_version
+        diagnostic_optical_version = pair.optical.downloaded_global_version
+        local_log_start = len(local_log)
         train_pair_offline(pair, contact["start_offset_s"], config, radar_worker, optical_worker, radar_auxiliary, optical_auxiliary, radar_projection, optical_projection, attention_bias, criterion, device, epoch, local_log)
+        diagnostic_after = projection_diagnostics.measure(pair, diagnostic_batch, *diagnostic_modules)
+        diagnostic_steps = len(local_log) - local_log_start
         # 2) 找到双模态缓冲区中可对齐融合的批次(batch_number 交集)
         matched_ids = pair.matched_batch_ids()
         version_lag, needs_sync = contact_version_lag(pair, matched_ids, global_version, config)
@@ -301,6 +318,23 @@ def run_training(config, raw_contacts, output_dir: Path):
             "download_s": round(estimate["download_s"], 8),
         })
         # 星上本地训练只允许发生在不可见时段:把该对时钟直接推进到窗口结束
+        # 每个窗口一行，包括 skipped / model_synced；先于同步测得的指标不会混入下载影响。
+        projection_diagnostics.append({
+            "pair_contact_id": contact["pair_contact_id"], "pair_id": pair.pair_id,
+            "contact_start_utc": contact["start_utc"], "contact_end_utc": contact["end_utc"],
+            "disconnection_start_utc": utc_at(epoch, diagnostic_start_s),
+            "disconnection_end_utc": contact["start_utc"],
+            "disconnection_duration_s": max(0.0, contact["start_offset_s"] - diagnostic_start_s),
+            "freeze_projection_during_disconnection": int(bool(training.get("freeze_projection_during_disconnection", True))),
+            "teacher_global_version": diagnostic_global_version,
+            "radar_downloaded_global_version": diagnostic_radar_version,
+            "optical_downloaded_global_version": diagnostic_optical_version,
+            "requested_sample_count": int(training["batch_size"]),
+            "sample_count": len(diagnostic_batch[2]),
+            "sample_ids": ";".join(map(str, diagnostic_batch[2])),
+            "local_paired_steps": diagnostic_steps,
+            "contact_status": status, "contact_reason": reason,
+        }, diagnostic_before, diagnostic_after)
         pair.local_clock_s = max(pair.local_clock_s, contact["end_offset_s"])
 
     # 主循环结束后:各对在剩余时间内完成剩余的本地训练(不再有新事务与聚合)
@@ -353,6 +387,7 @@ def run_training(config, raw_contacts, output_dir: Path):
     print(json.dumps(summary, indent=2))
     print(f"Pair contacts: {output_dir / 'pair_contact_windows.csv'}")
     print(f"Training log: {output_dir / 'multimodal_training_log.csv'}")
+    print(f"Projection diagnostics: {projection_diagnostics.path}")
 
 
 def main():

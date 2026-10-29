@@ -249,6 +249,33 @@ uses CPU.
 
 ## Outputs
 
+### Projection alignment diagnostics
+
+`multimodal_croma_demo.py` records one row per paired contact (including skipped
+and model-download-only contacts) in `multimodal_projection_diagnostics.csv`.
+For each window it samples up to `batch_size` distinct samples from that pair's
+training partition using an independent seeded generator. The identical input
+tensors are evaluated before and after the disconnected local training that
+precedes the contact, before any ground optimization, aggregation, or download.
+The cross encoder weights are fixed across these two measurements; its outputs
+are recomputed using the corresponding before/after local encoders.
+
+Each token vector is L2-normalized along its feature dimension (epsilon 1e-8).
+Normalized MSE is averaged over samples, tokens, and feature coordinates;
+cosine similarity is averaged over samples and tokens. The CSV records radar
+and optical `normalized_mse` / `cosine_similarity`, each with `_before`,
+`_after`, and `_delta` (after minus before). Lower MSE and higher cosine mean
+better alignment. With nonzero vectors these metrics are mathematically related
+(MSE = 2 * (1 - cosine) / feature_dim), not independent evidence.
+
+The log includes sample IDs/counts, local training steps, frozen/unfrozen flag,
+model versions, virtual disconnection interval, and the later contact outcome.
+If no local step ran, before/after should be unchanged. These are training-set
+diagnostics, not held-out generalization measurements. Inputs/labels are never
+used for diagnostic optimization. Diagnostics restore shared worker weights,
+module modes, and training RNG states; they do not advance batch cursors or
+virtual time, but do add real runtime. CSV rows are appended at every window.
+
 - `outputs/contact_windows.csv`: individual direct satellite contacts
 - `outputs/orbit_states.csv`: generated satellite orbit states
 - `../multimodal_croma_demo/<timestamp>/config.json`: exact config copy for one run
